@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -22,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -33,12 +29,22 @@ const defaultKeySize = 2048
 const defaultCALifetime = 10 * 366 * 24 * time.Hour  // ten years
 const defaultCertLifetime = 5 * 366 * 24 * time.Hour // five years
 
+// Options settable via command-line flags. See below for defaults.
 var keySize int
 var caCertificateLifetime time.Duration
 var certificateLifetime time.Duration
 var allowCAKeyReuse bool
 var overwriteFiles bool
 var generatePKCS8Key bool
+
+func initPreFlagsCertDefaults() {
+	keySize = defaultKeySize
+	caCertificateLifetime = defaultCALifetime
+	certificateLifetime = defaultCertLifetime
+	allowCAKeyReuse = false
+	overwriteFiles = false
+	generatePKCS8Key = false
+}
 
 // A createCACert command generates a CA certificate and stores it
 // in the cert directory.
@@ -177,7 +183,7 @@ func runCreateClientCert(cmd *cobra.Command, args []string) error {
 	var err error
 	var username string
 	// We intentionally allow the `node` user to have a cert.
-	if username, err = sql.NormalizeAndValidateUsernameNoBlacklist(args[0]); err != nil {
+	if username, err = sql.NormalizeAndValidateUsernameNoBlocklist(args[0]); err != nil {
 		return errors.Wrap(err, "failed to generate client certificate and key")
 	}
 
@@ -207,9 +213,9 @@ List certificates and keys found in the certificate directory.
 
 // runListCerts loads and lists all certs.
 func runListCerts(cmd *cobra.Command, args []string) error {
-	cm, err := baseCfg.GetCertificateManager()
+	cm, err := security.NewCertificateManager(baseCfg.SSLCertsDir, security.CommandTLSSettings{})
 	if err != nil {
-		return errors.Wrap(err, "could not get certificate manager")
+		return errors.Wrap(err, "cannot load certificates")
 	}
 
 	fmt.Fprintf(os.Stdout, "Certificate directory: %s\n", baseCfg.SSLCertsDir)

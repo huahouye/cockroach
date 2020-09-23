@@ -1,23 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
+	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
 )
 
@@ -27,6 +23,13 @@ type logTagsOption logtags.Buffer
 var _ opentracing.StartSpanOption = &logTagsOption{}
 
 // Apply is part of the opentracing.StartSpanOption interface.
+//
+// The tags in the buffer go through the log tag -> span tag remapping (see
+// tagName()).
+//
+// Note that our tracer does not call Apply() for this options. Instead, it
+// recognizes it as a special case and treats it more efficiently, avoiding
+// allocations for each tag. Apply() is still used by shadow tracers.
 func (lt *logTagsOption) Apply(o *opentracing.StartSpanOptions) {
 	if lt == nil {
 		return
@@ -44,7 +47,8 @@ func (lt *logTagsOption) Apply(o *opentracing.StartSpanOptions) {
 }
 
 // LogTags returns a StartSpanOption that sets the span tags to the given log
-// tags.
+// tags. When applied, the returned option will apply any logtag name->span tag
+// name remapping that has been registered via RegisterTagRemapping.
 func LogTags(tags *logtags.Buffer) opentracing.StartSpanOption {
 	return (*logTagsOption)(tags)
 }

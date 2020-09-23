@@ -6,10 +6,12 @@ package roachpb
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
-import enginepb "github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+import lock "github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+import enginepb "github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 import hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 
 import github_com_cockroachdb_cockroach_pkg_util_uuid "github.com/cockroachdb/cockroach/pkg/util/uuid"
+import github_com_cockroachdb_cockroach_pkg_storage_enginepb "github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 
 import bytes "bytes"
 
@@ -45,6 +47,9 @@ const (
 	ValueType_DECIMAL           ValueType = 5
 	ValueType_DELIMITED_DECIMAL ValueType = 9
 	ValueType_DURATION          ValueType = 6
+	ValueType_TIMETZ            ValueType = 12
+	ValueType_GEO               ValueType = 13
+	ValueType_BOX2D             ValueType = 14
 	// TUPLE represents a DTuple, encoded as repeated pairs of varint field number
 	// followed by a value encoded Datum.
 	ValueType_TUPLE    ValueType = 10
@@ -63,6 +68,9 @@ var ValueType_name = map[int32]string{
 	5:   "DECIMAL",
 	9:   "DELIMITED_DECIMAL",
 	6:   "DURATION",
+	12:  "TIMETZ",
+	13:  "GEO",
+	14:  "BOX2D",
 	10:  "TUPLE",
 	11:  "BITARRAY",
 	100: "TIMESERIES",
@@ -77,6 +85,9 @@ var ValueType_value = map[string]int32{
 	"DECIMAL":           5,
 	"DELIMITED_DECIMAL": 9,
 	"DURATION":          6,
+	"TIMETZ":            12,
+	"GEO":               13,
+	"BOX2D":             14,
 	"TUPLE":             10,
 	"BITARRAY":          11,
 	"TIMESERIES":        100,
@@ -86,7 +97,7 @@ func (x ValueType) String() string {
 	return proto.EnumName(ValueType_name, int32(x))
 }
 func (ValueType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{0}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{0}
 }
 
 // ReplicaChangeType is a parameter of ChangeReplicasTrigger.
@@ -110,7 +121,7 @@ func (x ReplicaChangeType) String() string {
 	return proto.EnumName(ReplicaChangeType_name, int32(x))
 }
 func (ReplicaChangeType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{1}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{1}
 }
 
 // TransactionStatus specifies possible states for a transaction.
@@ -122,6 +133,16 @@ const (
 	// as part of a PENDING transactions are recorded as "intents" in
 	// the underlying MVCC model.
 	PENDING TransactionStatus = 0
+	// STAGING is the state for a transaction which has issued all of
+	// its writes and is in the process of committing. Mutations made
+	// as part of a transaction in this state may still be in-flight
+	// and can not be assumed to have succeeded. A transaction may
+	// transition from the STAGING to the COMMITTED state only if all
+	// of its in-flight mutations are confirmed to have succeeded. A
+	// transaction may transition from the STAGING to PENDING or ABORTED
+	// state only if one of its in-flight requests is prevented from ever
+	// succeeding.
+	STAGING TransactionStatus = 3
 	// COMMITTED is the state for a transaction which has been
 	// committed. Mutations made as part of a transaction which is moved
 	// into COMMITTED state become durable and visible to other
@@ -137,11 +158,13 @@ const (
 
 var TransactionStatus_name = map[int32]string{
 	0: "PENDING",
+	3: "STAGING",
 	1: "COMMITTED",
 	2: "ABORTED",
 }
 var TransactionStatus_value = map[string]int32{
 	"PENDING":   0,
+	"STAGING":   3,
 	"COMMITTED": 1,
 	"ABORTED":   2,
 }
@@ -150,7 +173,7 @@ func (x TransactionStatus) String() string {
 	return proto.EnumName(TransactionStatus_name, int32(x))
 }
 func (TransactionStatus) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{2}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{2}
 }
 
 // Span is a key range with an inclusive start Key and an exclusive end Key.
@@ -161,15 +184,13 @@ type Span struct {
 	// contains only a single key. Otherwise, it must order strictly after Key.
 	// In such a case, the Span encompasses the key range from Key to EndKey,
 	// including Key and excluding EndKey.
-	EndKey               Key      `protobuf:"bytes,4,opt,name=end_key,json=endKey,proto3,casttype=Key" json:"end_key,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	EndKey Key `protobuf:"bytes,4,opt,name=end_key,json=endKey,proto3,casttype=Key" json:"end_key,omitempty"`
 }
 
 func (m *Span) Reset()      { *m = Span{} }
 func (*Span) ProtoMessage() {}
 func (*Span) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{0}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{0}
 }
 func (m *Span) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -210,18 +231,18 @@ var xxx_messageInfo_Span proto.InternalMessageInfo
 // will be less than 64KB?
 type Value struct {
 	// raw_bytes contains the encoded value and checksum.
+	//
+	// Its contents may be modified on the next call to Value.SetFoo.
 	RawBytes []byte `protobuf:"bytes,1,opt,name=raw_bytes,json=rawBytes,proto3" json:"raw_bytes,omitempty"`
 	// Timestamp of value.
-	Timestamp            hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *Value) Reset()         { *m = Value{} }
 func (m *Value) String() string { return proto.CompactTextString(m) }
 func (*Value) ProtoMessage()    {}
 func (*Value) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{1}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{1}
 }
 func (m *Value) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -249,17 +270,15 @@ var xxx_messageInfo_Value proto.InternalMessageInfo
 // KeyValue is a pair of Key and Value for returned Key/Value pairs
 // from ScanRequest/ScanResponse. It embeds a Key and a Value.
 type KeyValue struct {
-	Key                  Key      `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
-	Value                Value    `protobuf:"bytes,2,opt,name=value,proto3" json:"value"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Key   Key   `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
+	Value Value `protobuf:"bytes,2,opt,name=value,proto3" json:"value"`
 }
 
 func (m *KeyValue) Reset()         { *m = KeyValue{} }
 func (m *KeyValue) String() string { return proto.CompactTextString(m) }
 func (*KeyValue) ProtoMessage()    {}
 func (*KeyValue) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{2}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{2}
 }
 func (m *KeyValue) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -288,18 +307,16 @@ var xxx_messageInfo_KeyValue proto.InternalMessageInfo
 // StoreIdent is written to the underlying storage engine at a
 // store-reserved system key (KeyLocalIdent).
 type StoreIdent struct {
-	ClusterID            github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"cluster_id"`
-	NodeID               NodeID                                              `protobuf:"varint,2,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
-	StoreID              StoreID                                             `protobuf:"varint,3,opt,name=store_id,json=storeId,proto3,casttype=StoreID" json:"store_id,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	ClusterID github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"cluster_id"`
+	NodeID    NodeID                                              `protobuf:"varint,2,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
+	StoreID   StoreID                                             `protobuf:"varint,3,opt,name=store_id,json=storeId,proto3,casttype=StoreID" json:"store_id,omitempty"`
 }
 
 func (m *StoreIdent) Reset()         { *m = StoreIdent{} }
 func (m *StoreIdent) String() string { return proto.CompactTextString(m) }
 func (*StoreIdent) ProtoMessage()    {}
 func (*StoreIdent) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{3}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{3}
 }
 func (m *StoreIdent) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -331,17 +348,15 @@ var xxx_messageInfo_StoreIdent proto.InternalMessageInfo
 // allows the final bookkeeping for the split to be completed and the
 // new range put into operation.
 type SplitTrigger struct {
-	LeftDesc             RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc,proto3" json:"left_desc"`
-	RightDesc            RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc,proto3" json:"right_desc"`
-	XXX_NoUnkeyedLiteral struct{}        `json:"-"`
-	XXX_sizecache        int32           `json:"-"`
+	LeftDesc  RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc,proto3" json:"left_desc"`
+	RightDesc RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc,proto3" json:"right_desc"`
 }
 
 func (m *SplitTrigger) Reset()         { *m = SplitTrigger{} }
 func (m *SplitTrigger) String() string { return proto.CompactTextString(m) }
 func (*SplitTrigger) ProtoMessage()    {}
 func (*SplitTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{4}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{4}
 }
 func (m *SplitTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -382,16 +397,14 @@ type MergeTrigger struct {
 	// before it stopped responding to requests altogether (in anticipation of
 	// being subsumed). It is suitable for use as the timestamp cache's low water
 	// mark for the keys previously owned by the subsumed range.
-	FreezeStart          hlc.Timestamp `protobuf:"bytes,5,opt,name=freeze_start,json=freezeStart,proto3" json:"freeze_start"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	FreezeStart hlc.Timestamp `protobuf:"bytes,5,opt,name=freeze_start,json=freezeStart,proto3" json:"freeze_start"`
 }
 
 func (m *MergeTrigger) Reset()         { *m = MergeTrigger{} }
 func (m *MergeTrigger) String() string { return proto.CompactTextString(m) }
 func (*MergeTrigger) ProtoMessage()    {}
 func (*MergeTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{5}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{5}
 }
 func (m *MergeTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -416,21 +429,52 @@ func (m *MergeTrigger) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_MergeTrigger proto.InternalMessageInfo
 
+// ChangeReplicasTrigger carries out a replication change. The Added() and
+// Removed() methods return the replicas being added and removed, respectively.
+// If more than one change is specified (i.e. len(Added())+len(Removed())
+// exceeds one), this initiates an atomic replication change in which the
+// "removed" replicas are of type VOTER_OUTGOING or VOTER_DEMOTING (if they are
+// to be turned into learners instead); as a caveat a single demotion already
+// counts as two changes (and is tracked as a Removal() only). This joint
+// configuration is left via another ChangeReplicasTrigger which does not
+// specify any additions nor removals.
 type ChangeReplicasTrigger struct {
-	ChangeType ReplicaChangeType `protobuf:"varint,1,opt,name=change_type,json=changeType,proto3,enum=cockroach.roachpb.ReplicaChangeType" json:"change_type,omitempty"`
+	// TODO(tbg): remove once we know that no trigger using this will ever be
+	// applied (this will require something like #39182).
+	//
+	// TODO(tbg): when removing this, also rename internal_x_replicas to just
+	// x_replicas and remove the getter.
+	DeprecatedChangeType ReplicaChangeType `protobuf:"varint,1,opt,name=deprecated_change_type,json=deprecatedChangeType,proto3,enum=cockroach.roachpb.ReplicaChangeType" json:"deprecated_change_type,omitempty"`
 	// The replica being modified.
-	Replica ReplicaDescriptor `protobuf:"bytes,2,opt,name=replica,proto3" json:"replica"`
+	// TODO(tbg): remove once we know that no trigger using this will ever be
+	// applied (this will require something like #39182).
+	DeprecatedReplica ReplicaDescriptor `protobuf:"bytes,2,opt,name=deprecated_replica,json=deprecatedReplica,proto3" json:"deprecated_replica"`
 	// The new replica list with this change applied.
-	UpdatedReplicas      []ReplicaDescriptor `protobuf:"bytes,3,rep,name=updated_replicas,json=updatedReplicas,proto3" json:"updated_replicas"`
-	NextReplicaID        ReplicaID           `protobuf:"varint,4,opt,name=next_replica_id,json=nextReplicaId,proto3,casttype=ReplicaID" json:"next_replica_id,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
-	XXX_sizecache        int32               `json:"-"`
+	DeprecatedUpdatedReplicas []ReplicaDescriptor `protobuf:"bytes,3,rep,name=deprecated_updated_replicas,json=deprecatedUpdatedReplicas,proto3" json:"deprecated_updated_replicas"`
+	// The next replica id to use with this change applied.
+	DeprecatedNextReplicaID ReplicaID `protobuf:"varint,4,opt,name=deprecated_next_replica_id,json=deprecatedNextReplicaId,proto3,casttype=ReplicaID" json:"deprecated_next_replica_id,omitempty"`
+	// The updated range descriptor. If desc is non-nil, then it overrides
+	// updated_replicas and next_replica_id. This incremental addition is needed
+	// to maintain backwards compatibility.
+	// TODO(jeffreyxiao): Remove deprecated_updated_replicas and
+	// deprecated_next_replica_id in 20.1.
+	Desc *RangeDescriptor `protobuf:"bytes,5,opt,name=desc,proto3" json:"desc,omitempty"`
+	// The new replicas added to the range descriptor in this change, exactly as
+	// they appear in the updated range descriptor.
+	InternalAddedReplicas []ReplicaDescriptor `protobuf:"bytes,6,rep,name=internal_added_replicas,json=internalAddedReplicas,proto3" json:"internal_added_replicas"`
+	// The replicas whose removal is being initiated in this change. If the
+	// replica is still present as an outgoing voter in the updated descriptor
+	// (i.e. if this is a full atomic replication change), then the replica here
+	// must match that in the descriptor; otherwise it must match the replica
+	// removed from the descriptor in the course of this change (which is itself
+	// not visible to this trigger).
+	InternalRemovedReplicas []ReplicaDescriptor `protobuf:"bytes,7,rep,name=internal_removed_replicas,json=internalRemovedReplicas,proto3" json:"internal_removed_replicas"`
 }
 
 func (m *ChangeReplicasTrigger) Reset()      { *m = ChangeReplicasTrigger{} }
 func (*ChangeReplicasTrigger) ProtoMessage() {}
 func (*ChangeReplicasTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{6}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{6}
 }
 func (m *ChangeReplicasTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -465,16 +509,14 @@ type ModifiedSpanTrigger struct {
 	// with heartbeats to extend the expiration timestamp. Changes to the
 	// range lease for the range containing node liveness triggers re-gossip
 	// of the entire node liveness key range.
-	NodeLivenessSpan     *Span    `protobuf:"bytes,2,opt,name=node_liveness_span,json=nodeLivenessSpan,proto3" json:"node_liveness_span,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	NodeLivenessSpan *Span `protobuf:"bytes,2,opt,name=node_liveness_span,json=nodeLivenessSpan,proto3" json:"node_liveness_span,omitempty"`
 }
 
 func (m *ModifiedSpanTrigger) Reset()         { *m = ModifiedSpanTrigger{} }
 func (m *ModifiedSpanTrigger) String() string { return proto.CompactTextString(m) }
 func (*ModifiedSpanTrigger) ProtoMessage()    {}
 func (*ModifiedSpanTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{7}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{7}
 }
 func (m *ModifiedSpanTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -499,6 +541,52 @@ func (m *ModifiedSpanTrigger) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_ModifiedSpanTrigger proto.InternalMessageInfo
 
+// StickyBitTrigger indicates that the sticky bit of a range should be changed.
+// This trigger is used in two cases:
+// 1. Unsplitting a range. Note that unsplitting and merging are different
+//    operations. Unsplitting a range will only update the expiration time
+//    associated with the range to hlc.Timestamp{}.
+// 2. Splitting at the start key of a range. In this case, no range is split but
+//    the sticky bit is might be updated, so we need to use this trigger instead
+//    of SplitTrigger.
+//
+// Note that the sticky_bit should always be set to the same timestamp used to
+// update the range descriptor and it's the client's responsibility that the
+// timestamps are aligned.
+type StickyBitTrigger struct {
+	// Set to nil to remove a RangeDescriptor's sticky bit.
+	StickyBit hlc.Timestamp `protobuf:"bytes,1,opt,name=sticky_bit,json=stickyBit,proto3" json:"sticky_bit"`
+}
+
+func (m *StickyBitTrigger) Reset()         { *m = StickyBitTrigger{} }
+func (m *StickyBitTrigger) String() string { return proto.CompactTextString(m) }
+func (*StickyBitTrigger) ProtoMessage()    {}
+func (*StickyBitTrigger) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{8}
+}
+func (m *StickyBitTrigger) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StickyBitTrigger) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *StickyBitTrigger) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StickyBitTrigger.Merge(dst, src)
+}
+func (m *StickyBitTrigger) XXX_Size() int {
+	return m.Size()
+}
+func (m *StickyBitTrigger) XXX_DiscardUnknown() {
+	xxx_messageInfo_StickyBitTrigger.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StickyBitTrigger proto.InternalMessageInfo
+
 // InternalCommitTrigger encapsulates all of the internal-only commit triggers.
 // Only one may be set.
 type InternalCommitTrigger struct {
@@ -506,15 +594,14 @@ type InternalCommitTrigger struct {
 	MergeTrigger          *MergeTrigger          `protobuf:"bytes,2,opt,name=merge_trigger,json=mergeTrigger,proto3" json:"merge_trigger,omitempty"`
 	ChangeReplicasTrigger *ChangeReplicasTrigger `protobuf:"bytes,3,opt,name=change_replicas_trigger,json=changeReplicasTrigger,proto3" json:"change_replicas_trigger,omitempty"`
 	ModifiedSpanTrigger   *ModifiedSpanTrigger   `protobuf:"bytes,4,opt,name=modified_span_trigger,json=modifiedSpanTrigger,proto3" json:"modified_span_trigger,omitempty"`
-	XXX_NoUnkeyedLiteral  struct{}               `json:"-"`
-	XXX_sizecache         int32                  `json:"-"`
+	StickyBitTrigger      *StickyBitTrigger      `protobuf:"bytes,5,opt,name=sticky_bit_trigger,json=stickyBitTrigger,proto3" json:"sticky_bit_trigger,omitempty"`
 }
 
 func (m *InternalCommitTrigger) Reset()         { *m = InternalCommitTrigger{} }
 func (m *InternalCommitTrigger) String() string { return proto.CompactTextString(m) }
 func (*InternalCommitTrigger) ProtoMessage()    {}
 func (*InternalCommitTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{8}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{9}
 }
 func (m *InternalCommitTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -567,18 +654,23 @@ func (m *InternalCommitTrigger) GetModifiedSpanTrigger() *ModifiedSpanTrigger {
 	return nil
 }
 
+func (m *InternalCommitTrigger) GetStickyBitTrigger() *StickyBitTrigger {
+	if m != nil {
+		return m.StickyBitTrigger
+	}
+	return nil
+}
+
 type ObservedTimestamp struct {
-	NodeID               NodeID        `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
-	Timestamp            hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	NodeID    NodeID        `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
+	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *ObservedTimestamp) Reset()         { *m = ObservedTimestamp{} }
 func (m *ObservedTimestamp) String() string { return proto.CompactTextString(m) }
 func (*ObservedTimestamp) ProtoMessage()    {}
 func (*ObservedTimestamp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{9}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{10}
 }
 func (m *ObservedTimestamp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -612,23 +704,40 @@ var xxx_messageInfo_ObservedTimestamp proto.InternalMessageInfo
 // If you add fields to Transaction you'll need to update
 // Transaction.Clone. Failure to do so will result in test failures.
 type Transaction struct {
-	// The transaction metadata. These are persisted with every intent.
+	// The transaction metadata. This field includes the subset of information
+	// that is persisted with every write intent.
 	enginepb.TxnMeta `protobuf:"bytes,1,opt,name=meta,proto3,embedded=meta" json:"meta"`
 	// A free-text identifier for debug purposes.
-	Name          string            `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Status        TransactionStatus `protobuf:"varint,4,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
-	LastHeartbeat hlc.Timestamp     `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
-	// The original timestamp at which the transaction started. For serializable
-	// transactions, if the timestamp drifts from the original timestamp, the
-	// transaction will retry unless we manage to "refresh the reads" - see
-	// refreshed_timestamp.
-	//
-	// This timestamp is the one at which all reads occur, unless
-	// refreshed_timestamp is set.
-	//
-	// Note that writes do not occur at this timestamp; they instead occur at the
-	// provisional commit timestamp, meta.Timestamp.
-	OrigTimestamp hlc.Timestamp `protobuf:"bytes,6,opt,name=orig_timestamp,json=origTimestamp,proto3" json:"orig_timestamp"`
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// The status of the transaction.
+	Status TransactionStatus `protobuf:"varint,4,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
+	// The last time that the transaction's record was sent a heartbeat by its
+	// coordinator to indicate client activity. Concurrent transactions will
+	// avoid aborting a transaction if it observes recent-enough activity.
+	LastHeartbeat hlc.Timestamp `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
+	// This flag is set if the transaction's timestamp was "leaked" beyond the
+	// transaction (e.g. via cluster_logical_timestamp()). If true, this prevents
+	// the transaction's timestamp from being pushed, which means that the txn
+	// can't commit at a higher timestamp without resorting to a client-side
+	// retry.
+	CommitTimestampFixed bool `protobuf:"varint,16,opt,name=commit_timestamp_fixed,json=commitTimestampFixed,proto3" json:"commit_timestamp_fixed,omitempty"`
+	// The transaction's read timestamp. All reads are performed at this
+	// timestamp, ensuring that the transaction runs on top of a consistent
+	// snapshot of the database.
+	// Writes are performed at the transaction's write timestamp (meta.timestamp).
+	// The write timestamp can diverge from the read timestamp when a write is
+	// "pushed": for example in case a write runs into the timestamp cache, we're
+	// forced to write at a higher timestamp. Being serializable, the transaction
+	// can't commit if the write timestamp diverged from the read timestamp unless
+	// we prove that the read timestamp can also be advanced to match the
+	// write timestamp; it can be advanced if the two timestamps are equivalent
+	// for everything that the transaction has read (meaning that there's no
+	// values in between the read timestamp and the write timestamp for any key in
+	// the txn's read set). We call checking whether the read timestamp can
+	// advance "refreshing the read set". So, the read timestamp advances after a
+	// successful refresh or, if the refresh is unsuccessful, after a transaction
+	// restart.
+	ReadTimestamp hlc.Timestamp `protobuf:"bytes,15,opt,name=read_timestamp,json=readTimestamp,proto3" json:"read_timestamp"`
 	// Initial Timestamp + clock skew. Reads which encounter values with
 	// timestamps between timestamp and max_timestamp trigger a txn
 	// retry error, unless the node being read is listed in observed_timestamps
@@ -636,96 +745,162 @@ type Transaction struct {
 	// The case max_timestamp < timestamp is possible for transactions which have
 	// been pushed; in this case, max_timestamp should be ignored.
 	MaxTimestamp hlc.Timestamp `protobuf:"bytes,7,opt,name=max_timestamp,json=maxTimestamp,proto3" json:"max_timestamp"`
-	// The refreshed timestamp is the timestamp at which the transaction
-	// can commit without necessitating a serializable restart. This
-	// value is forwarded to the transaction's current timestamp (meta.timestamp)
-	// if the transaction coordinator is able to refresh all refreshable spans
-	// encountered during the course of the txn. If set, this takes precedence
-	// over orig_timestamp and is the timestamp at which the transaction reads
-	// going forward.
-	//
-	// We need to keep track of both refresh_timestamp and orig_timestamp (instead
-	// of simply overwriting the orig_timestamp after refreshes) because the
-	// orig_timestamp needs to be used as a lower bound timestamp for the
-	// time-bound iterator used to resolve intents - i.e. there can be intents to
-	// resolve up to the timestamp that the txn started with.
-	RefreshedTimestamp hlc.Timestamp `protobuf:"bytes,15,opt,name=refreshed_timestamp,json=refreshedTimestamp,proto3" json:"refreshed_timestamp"`
 	// A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
 	// as observed from their local clock during this transaction. The purpose of
-	// this map is to avoid uncertainty related restarts which normally occur
+	// this list is to avoid uncertainty related restarts which normally occur
 	// when reading a value in the near future as per the max_timestamp field.
 	//
-	// Morally speaking, having an entry for a node in this map means that this
+	// ### Meaning:
+	//
+	// Morally speaking, having an entry for a node in this list means that this
 	// node has been visited before, and that no more uncertainty restarts are
 	// expected for operations served from it. However, this is not entirely
-	// accurate. For example, say a txn starts with orig_timestamp=1 (and some
+	// accurate. For example, say a txn starts with read_timestamp=1 (and some
 	// large max_timestamp). It then reads key "a" from node A, registering an
 	// entry `A -> 5` in the process (`5` happens to be a timestamp taken off
-	// that node's clock at the end of the read).
+	// that node's clock at the start of the read).
+	//
 	// Now assume that some other transaction writes and commits a value at key "b"
 	// and timestamp 4 (again, served by node A), and our transaction attempts to
 	// read that key. Since there is an entry in its observed_timestamps for A,
-	// our uncertainty window is `[orig_timestamp, 5) = [1, 5)` but the value at
+	// our uncertainty window is `[read_timestamp, 5) = [1, 5)` but the value at
 	// key "b" is in that window, and so we will restart. However, we will restart
-	// with a timestamp that is at least high as our entry in the map for node A,
+	// with a timestamp that is at least high as our entry in the list for node A,
 	// so no future operation on node A will be uncertain.
 	//
-	// Thus, expressed properly, you could say that when a node has been read from
-	// successfully before, uncertainty on that node is restricted to values with
-	// timestamps in the interval [orig_timestamp, first_visit_timestamp), and
-	// that no node will trigger restarts more than once (and in fact, usually
-	// the first restart also bumps the txn timestamp enough to clear all other
-	// nodes).
+	// ### Correctness:
 	//
-	// When this list holds a corresponding entry for the node the current
-	// request is executing on, we can run the command with the map's timestamp
-	// as the top boundary of our uncertainty interval, limiting (and often
-	// avoiding) uncertainty restarts.
+	// Thus, expressed properly, we can say that when a node has been read from
+	// successfully before by a transaction, uncertainty for values written by a
+	// leaseholder on that node is restricted to values with timestamps in the
+	// interval [read_timestamp, first_visit_timestamp). An upper bound can be
+	// placed on the uncertainty window because we are guaranteed that at the time
+	// that the transaction first visited the node, none of the Ranges that it was
+	// a leaseholder for had served any writes at higher timestamps than the clock
+	// reading we observe. This implies the following property:
+	//
+	//    Any writes that the transaction may later see written by leaseholders on
+	//    this node at higher timestamps than the observed timestamp could not have
+	//    taken place causally before this transaction and can be ignored for the
+	//    purposes of uncertainty.
+	//
+	// There are two invariants necessary for this property to hold:
+	// 1. a leaseholder's clock must always be equal to or greater than the timestamp
+	//    of all writes that it has served. This is trivial to enforce for
+	//    non-transactional writes. It is more complicated for transactional writes
+	//    which may move their commit timestamp forward over their lifetime before
+	//    committing, even after writing intents on remote Ranges. To accommodate
+	//    this situation, transactions ensure that at the time of their commit, any
+	//    leaseholder for a Range that contains one of its intent has an HLC clock
+	//    with an equal or greater timestamp than the transaction's commit timestamp.
+	//    TODO(nvanbenschoten): This is violated by txn refreshes. See #36431.
+	// 2. a leaseholder's clock must always be equal to or greater than the timestamp
+	//    of all writes that previous leaseholders for its Range have served. We
+	//    enforce that when a Replica acquires a lease it bumps its node's clock to a
+	//    time higher than the previous leaseholder's clock when it stopped serving
+	//    writes. This is accomplished cooperatively for lease transfers and through
+	//    a statis period before lease expiration for lease acquisitions. It then
+	//    follows by induction that, in conjunction with the previous invariant, this
+	//    invariant holds for all leaseholders, given that a Range's initial
+	//    leaseholder assumes responsibility for an empty range with no writes.
+	//
+	// ### Usage:
+	//
+	// The property ensures that when this list holds a corresponding entry for
+	// the node who owns the lease that the current request is executing under, we
+	// can run the request with the list's timestamp as the upper bound for its
+	// uncertainty interval, limiting (and often avoiding) uncertainty restarts.
+	// We do this by lowering the request's max_timestamp down to the timestamp in
+	// the observed timestamp entry, which is done in Replica.limitTxnMaxTimestamp.
+	//
+	// However, as stated, the correctness property only holds for values at
+	// higher timestamps than the observed timestamp written *by leaseholders on
+	// this node*. This is critical, as the property tells us nothing about values
+	// written by leaseholders on different nodes, even if a lease for one of
+	// those Ranges has since moved to a node that we have an observed timestamp
+	// entry for. To accommodate this limitation, Replica.limitTxnMaxTimestamp
+	// first forwards the timestamp in the observed timestamp entry by the start
+	// timestamp of the lease that the request is executing under before using it
+	// to limit the request's uncertainty interval.
 	//
 	// When a transaction is first initialized on a node, it may use a timestamp
 	// from the local hybrid logical clock to initialize the corresponding entry
-	// in the map. In particular, if `orig_timestamp` is taken from that node's
-	// clock, we may add that to the map, which eliminates read uncertainty for
+	// in the list. In particular, if `read_timestamp` is taken from that node's
+	// clock, we may add that to the list, which eliminates read uncertainty for
 	// reads on that node.
 	//
-	// The list of observed timestamps is kept sorted by NodeID. Use
-	// Transaction.UpdateObservedTimestamp to maintain the sorted order.
+	// The slice of observed timestamps is kept sorted by NodeID. Use
+	// Transaction.UpdateObservedTimestamp to maintain the sorted order. The
+	// slice should be treated as immutable and all updates should be performed
+	// on a copy of the slice.
 	ObservedTimestamps []ObservedTimestamp `protobuf:"bytes,8,rep,name=observed_timestamps,json=observedTimestamps,proto3" json:"observed_timestamps"`
-	// Writing is true if the transaction has previously sent a Begin transaction
-	// (i.e. if it ever attempted to perform a write, so if it ever attempted to
-	// leave intents (across retries)). The flag will be set even if the BeginTxn
-	// batch failed.
-	// When set, the AbortCache must be checked by reads so that they don't miss
-	// to see the txn's previous writes.
-	Writing bool `protobuf:"varint,9,opt,name=writing,proto3" json:"writing,omitempty"`
-	// If this is true, the transaction must retry. Relevant only for
-	// SNAPSHOT transactions: a SERIALIZABLE transaction would have to
-	// retry anyway due to its commit timestamp having moved forward (whenever
-	// write_too_old is set, meta.Timestamp has been pushed above orig_timestamp).
-	// This bool is set instead of immediately returning a txn retry
-	// error so that intents can continue to be laid down, minimizing
-	// work required on txn restart.
-	WriteTooOld bool   `protobuf:"varint,12,opt,name=write_too_old,json=writeTooOld,proto3" json:"write_too_old,omitempty"`
-	Intents     []Span `protobuf:"bytes,11,rep,name=intents,proto3" json:"intents"`
-	// Epoch zero timestamp is used to keep track of the earliest timestamp
-	// that any epoch of the transaction used. This is set only if the
-	// transaction is restarted and the epoch is bumped. It is used during
-	// intent resolution to more efficiently scan for intents.
-	EpochZeroTimestamp hlc.Timestamp `protobuf:"bytes,14,opt,name=epoch_zero_timestamp,json=epochZeroTimestamp,proto3" json:"epoch_zero_timestamp"`
-	// This flag is set if the transaction's original timestamp was
-	// "leaked" beyond the transaction (i.e. if returned via NOW() or
-	// transaction_timestamp()). If true, this prevents optimizations
-	// which commit at a higher timestamp without resorting to a
-	// client-side retry.
-	OrigTimestampWasObserved bool     `protobuf:"varint,16,opt,name=orig_timestamp_was_observed,json=origTimestampWasObserved,proto3" json:"orig_timestamp_was_observed,omitempty"`
-	XXX_NoUnkeyedLiteral     struct{} `json:"-"`
-	XXX_sizecache            int32    `json:"-"`
+	// If set, a write performed by the transaction could not be performed at the
+	// transaction's read timestamp because a newer value was present. Had our
+	// write been performed, it would have overwritten the other value even though
+	// that value might not have been read by a previous read in the transaction
+	// (i.e. lost update anomaly). The write is still performed, but this flag is
+	// set and the txn's write timestamp is bumped, so the client will not be able
+	// to commit without performing a refresh.
+	//
+	// Since 20.1, errors do not carry this flag; only successful BatchResponses
+	// do. When possible, such a BatchResponse is preferred to a WriteTooOldError
+	// because the former leaves intents behind to act as locks.
+	//
+	// On the client, the txnSpanRefresher terminates this flag by refreshing
+	// eagerly when the flag is set. If the key that generated the write too old
+	// condition had been previously read by the transaction, a refresh of the
+	// transaction's read span will surely fail. The client is not currently smart
+	// enough to avoid hopeless refreshes, though.
+	//
+	// Historically, this field was also important for SNAPSHOT transactions which
+	// could commit in other situations when the write timestamp is bumped, but
+	// not when this flag is set (since lost updates cannot be tolerated even in
+	// SNAPSHOT). In SERIALIZABLE isolation, transactions generally don't commit
+	// with a bumped write timestamp, so this flag is only telling us that a
+	// refresh is less likely to succeed than in other cases where
+	// ReadTimestamp != WriteTimestamp.
+	WriteTooOld bool `protobuf:"varint,12,opt,name=write_too_old,json=writeTooOld,proto3" json:"write_too_old,omitempty"`
+	// Set of spans that the transaction has acquired locks within. These are
+	// spans which must be resolved on txn completion. Note that these spans
+	// may be condensed to cover aggregate spans if the keys locked by the
+	// transaction exceeded a size threshold.
+	//
+	// The set logically extends to include the keys of all writes in the
+	// in-flight write set. However, those keys are not stored in this set
+	// to avoid duplication. This means that elements that are removed from
+	// that set should be merged into this one.
+	//
+	// The slice is maintained in sorted order and all spans are maximally
+	// merged such that no two spans here overlap each other. It should be
+	// treated as immutable and all updates should be performed on a copy
+	// of the slice.
+	LockSpans []Span `protobuf:"bytes,11,rep,name=lock_spans,json=lockSpans,proto3" json:"lock_spans"`
+	// Set of in-flight intent writes that have been issued by the transaction but
+	// which may not have succeeded yet. If any in-flight writes are provided, a
+	// committing EndTxn request will move a PENDING transaction to the STAGING
+	// status instead of the COMMITTED status. These in-flight writes must then
+	// all be confirmed as successful before the transaction can be moved from
+	// STAGING to COMMITTED. Because of this, the set will only ever contain
+	// entries when the transaction is STAGING. For more, see txnCommitter.
+	//
+	// The slice is maintained in sorted order by sequence number. It should be
+	// treated as immutable and all updates should be performed on a copy of the
+	// slice.
+	InFlightWrites []SequencedWrite `protobuf:"bytes,17,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
+	// A list of ignored seqnum ranges.
+	//
+	// The slice is maintained as non-overlapping, non-contiguous (i.e. it must
+	// coalesce ranges to avoid situations where a range's end seqnum is equal to
+	// the next range's start seqnum), and sorted in seqnum order. It should be
+	// treated as immutable and all updates should be performed on a copy of the
+	// slice.
+	IgnoredSeqNums []enginepb.IgnoredSeqNumRange `protobuf:"bytes,18,rep,name=ignored_seqnums,json=ignoredSeqnums,proto3" json:"ignored_seqnums"`
 }
 
 func (m *Transaction) Reset()      { *m = Transaction{} }
 func (*Transaction) ProtoMessage() {}
 func (*Transaction) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{10}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{11}
 }
 func (m *Transaction) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -764,19 +939,19 @@ var xxx_messageInfo_Transaction proto.InternalMessageInfo
 // AsTransaction methods.
 type TransactionRecord struct {
 	// See comments on Transaction proto.
-	enginepb.TxnMeta     `protobuf:"bytes,1,opt,name=meta,proto3,embedded=meta" json:"meta"`
-	Status               TransactionStatus `protobuf:"varint,4,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
-	LastHeartbeat        hlc.Timestamp     `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
-	Intents              []Span            `protobuf:"bytes,11,rep,name=intents,proto3" json:"intents"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	enginepb.TxnMeta `protobuf:"bytes,1,opt,name=meta,proto3,embedded=meta" json:"meta"`
+	Status           TransactionStatus             `protobuf:"varint,4,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
+	LastHeartbeat    hlc.Timestamp                 `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
+	LockSpans        []Span                        `protobuf:"bytes,11,rep,name=lock_spans,json=lockSpans,proto3" json:"lock_spans"`
+	InFlightWrites   []SequencedWrite              `protobuf:"bytes,17,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
+	IgnoredSeqNums   []enginepb.IgnoredSeqNumRange `protobuf:"bytes,18,rep,name=ignored_seqnums,json=ignoredSeqnums,proto3" json:"ignored_seqnums"`
 }
 
 func (m *TransactionRecord) Reset()         { *m = TransactionRecord{} }
 func (m *TransactionRecord) String() string { return proto.CompactTextString(m) }
 func (*TransactionRecord) ProtoMessage()    {}
 func (*TransactionRecord) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{11}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{12}
 }
 func (m *TransactionRecord) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -801,20 +976,22 @@ func (m *TransactionRecord) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TransactionRecord proto.InternalMessageInfo
 
-// A Intent is a Span together with a Transaction metadata and its status.
+// A Intent is a Span together with a Transaction metadata. Intents messages
+// are used to reference persistent on-disk write intents. They are used on
+// the return path of e.g. scans, to report the existence of a write intent
+// on a key.
+//
+// Note: avoid constructing Intent directly; consider using MakeIntent() instead.
 type Intent struct {
-	Span                 `protobuf:"bytes,1,opt,name=span,proto3,embedded=span" json:"span"`
-	Txn                  enginepb.TxnMeta  `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
-	Status               TransactionStatus `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	Intent_SingleKeySpan `protobuf:"bytes,1,opt,name=single_key_span,json=singleKeySpan,proto3,embedded=single_key_span" json:"single_key_span"`
+	Txn                  enginepb.TxnMeta `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
 }
 
 func (m *Intent) Reset()         { *m = Intent{} }
 func (m *Intent) String() string { return proto.CompactTextString(m) }
 func (*Intent) ProtoMessage()    {}
 func (*Intent) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{12}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{13}
 }
 func (m *Intent) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -839,25 +1016,134 @@ func (m *Intent) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_Intent proto.InternalMessageInfo
 
+// SingleKeySpan preseves wire compatibility with an earlier version of this
+// proto which used a Span. An Intent never spans keys, so there was no need
+// for this to contain an EndKey.
+type Intent_SingleKeySpan struct {
+	// The start key of the key range.
+	Key Key `protobuf:"bytes,3,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
+}
+
+func (m *Intent_SingleKeySpan) Reset()         { *m = Intent_SingleKeySpan{} }
+func (m *Intent_SingleKeySpan) String() string { return proto.CompactTextString(m) }
+func (*Intent_SingleKeySpan) ProtoMessage()    {}
+func (*Intent_SingleKeySpan) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{13, 0}
+}
+func (m *Intent_SingleKeySpan) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *Intent_SingleKeySpan) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *Intent_SingleKeySpan) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_Intent_SingleKeySpan.Merge(dst, src)
+}
+func (m *Intent_SingleKeySpan) XXX_Size() int {
+	return m.Size()
+}
+func (m *Intent_SingleKeySpan) XXX_DiscardUnknown() {
+	xxx_messageInfo_Intent_SingleKeySpan.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_Intent_SingleKeySpan proto.InternalMessageInfo
+
+// A LockAcquisition represents the action of a Transaction acquiring a lock
+// with a specified durbility level over a Span of keys.
+type LockAcquisition struct {
+	Span       `protobuf:"bytes,1,opt,name=span,proto3,embedded=span" json:"span"`
+	Txn        enginepb.TxnMeta `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
+	Durability lock.Durability  `protobuf:"varint,3,opt,name=durability,proto3,enum=cockroach.kv.kvserver.concurrency.lock.Durability" json:"durability,omitempty"`
+}
+
+func (m *LockAcquisition) Reset()         { *m = LockAcquisition{} }
+func (m *LockAcquisition) String() string { return proto.CompactTextString(m) }
+func (*LockAcquisition) ProtoMessage()    {}
+func (*LockAcquisition) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{14}
+}
+func (m *LockAcquisition) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *LockAcquisition) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *LockAcquisition) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_LockAcquisition.Merge(dst, src)
+}
+func (m *LockAcquisition) XXX_Size() int {
+	return m.Size()
+}
+func (m *LockAcquisition) XXX_DiscardUnknown() {
+	xxx_messageInfo_LockAcquisition.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_LockAcquisition proto.InternalMessageInfo
+
+// A LockUpdate is a Span together with Transaction state. LockUpdate messages
+// are used to update all locks held by the transaction within the span to the
+// transaction's authoritative state. As such, the message is used as input
+// argument to intent resolution, to pass the current txn status, timestamps and
+// ignored seqnum ranges to the resolution algorithm.
+type LockUpdate struct {
+	Span           `protobuf:"bytes,1,opt,name=span,proto3,embedded=span" json:"span"`
+	Txn            enginepb.TxnMeta              `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
+	Status         TransactionStatus             `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
+	IgnoredSeqNums []enginepb.IgnoredSeqNumRange `protobuf:"bytes,4,rep,name=ignored_seqnums,json=ignoredSeqnums,proto3" json:"ignored_seqnums"`
+}
+
+func (m *LockUpdate) Reset()         { *m = LockUpdate{} }
+func (m *LockUpdate) String() string { return proto.CompactTextString(m) }
+func (*LockUpdate) ProtoMessage()    {}
+func (*LockUpdate) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{15}
+}
+func (m *LockUpdate) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *LockUpdate) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *LockUpdate) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_LockUpdate.Merge(dst, src)
+}
+func (m *LockUpdate) XXX_Size() int {
+	return m.Size()
+}
+func (m *LockUpdate) XXX_DiscardUnknown() {
+	xxx_messageInfo_LockUpdate.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_LockUpdate proto.InternalMessageInfo
+
 // A SequencedWrite is a point write to a key with a certain sequence number.
-//
-// TODO(nvanbenschoten/tschottdorf): This message type can be used as the
-// PromisedWrites repeated field in EndTransaction in the parallel commits
-// proposal (#24194).
 type SequencedWrite struct {
 	// The key that the write was made at.
 	Key Key `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
 	// The sequence number of the request that created the write.
-	Sequence             int32    `protobuf:"varint,2,opt,name=sequence,proto3" json:"sequence,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Sequence github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnSeq `protobuf:"varint,2,opt,name=sequence,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/enginepb.TxnSeq" json:"sequence,omitempty"`
 }
 
 func (m *SequencedWrite) Reset()         { *m = SequencedWrite{} }
 func (m *SequencedWrite) String() string { return proto.CompactTextString(m) }
 func (*SequencedWrite) ProtoMessage()    {}
 func (*SequencedWrite) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{13}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{16}
 }
 func (m *SequencedWrite) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -891,11 +1177,11 @@ type Lease struct {
 	Start hlc.Timestamp `protobuf:"bytes,1,opt,name=start,proto3" json:"start"`
 	// The expiration is a timestamp at which the lease expires. This means that
 	// a new lease can be granted for a later timestamp.
-	Expiration *hlc.Timestamp `protobuf:"bytes,2,opt,name=expiration,proto3" json:"expiration,omitempty" cockroachdb:"randnullable"`
+	Expiration *hlc.Timestamp `protobuf:"bytes,2,opt,name=expiration,proto3" json:"expiration,omitempty"`
 	// The address of the would-be lease holder.
 	Replica ReplicaDescriptor `protobuf:"bytes,3,opt,name=replica,proto3" json:"replica"`
 	// The start of the lease stasis period. This field is deprecated.
-	DeprecatedStartStasis *hlc.Timestamp `protobuf:"bytes,4,opt,name=deprecated_start_stasis,json=deprecatedStartStasis,proto3" json:"deprecated_start_stasis,omitempty" cockroachdb:"randnullable"`
+	DeprecatedStartStasis *hlc.Timestamp `protobuf:"bytes,4,opt,name=deprecated_start_stasis,json=deprecatedStartStasis,proto3" json:"deprecated_start_stasis,omitempty"`
 	// The current timestamp when this lease has been proposed. Used after a
 	// transfer and after a node restart to enforce that a node only uses leases
 	// proposed after the time of the said transfer or restart. This is nullable
@@ -915,15 +1201,13 @@ type Lease struct {
 	// (see Lease.Equivalent). Two adjacent leases that are equivalent will have
 	// the same sequence number and two adjacent leases that are not equivalent
 	// will have different sequence numbers.
-	Sequence             LeaseSequence `protobuf:"varint,7,opt,name=sequence,proto3,casttype=LeaseSequence" json:"sequence,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	Sequence LeaseSequence `protobuf:"varint,7,opt,name=sequence,proto3,casttype=LeaseSequence" json:"sequence,omitempty"`
 }
 
 func (m *Lease) Reset()      { *m = Lease{} }
 func (*Lease) ProtoMessage() {}
 func (*Lease) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{14}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{17}
 }
 func (m *Lease) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -961,16 +1245,14 @@ type AbortSpanEntry struct {
 	// it was aborted.
 	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 	// The priority of the transaction.
-	Priority             int32    `protobuf:"varint,3,opt,name=priority,proto3" json:"priority,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Priority github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnPriority `protobuf:"varint,3,opt,name=priority,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/enginepb.TxnPriority" json:"priority,omitempty"`
 }
 
 func (m *AbortSpanEntry) Reset()         { *m = AbortSpanEntry{} }
 func (m *AbortSpanEntry) String() string { return proto.CompactTextString(m) }
 func (*AbortSpanEntry) ProtoMessage()    {}
 func (*AbortSpanEntry) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{15}
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{18}
 }
 func (m *AbortSpanEntry) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -995,63 +1277,44 @@ func (m *AbortSpanEntry) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_AbortSpanEntry proto.InternalMessageInfo
 
-// TxnCoordMeta is metadata held by a transaction coordinator. This
-// message is defined here because it is used in several layers of the
-// system (internal/client, sql/distsqlrun, kv).
-type TxnCoordMeta struct {
-	// txn is a copy of the transaction record, updated with each request.
+// LeafTxnInputState is the state from a transaction coordinator
+// necessary and sufficient to set up a leaf transaction coordinator
+// on another node.
+type LeafTxnInputState struct {
+	// txn is a copy of the transaction record.
 	Txn Transaction `protobuf:"bytes,1,opt,name=txn,proto3" json:"txn"`
-	// intents stores key spans affected by this transaction through
-	// this coordinator. These spans allow the coordinator to set the
-	// list of intent spans in the EndTransactionRequest when the
-	// transaction is finalized.
-	Intents []Span `protobuf:"bytes,2,rep,name=intents,proto3" json:"intents"`
-	// command_count indicates how many requests have been sent through
-	// this transaction. Reset on retryable txn errors.
-	CommandCount int32 `protobuf:"varint,3,opt,name=command_count,json=commandCount,proto3" json:"command_count,omitempty"`
-	// refresh_reads and refresh_writes store key spans which were read
-	// or, less frequently, written during a transaction. These fields
-	// are utilized for SERIALIZABLE transactions in the event a
-	// transaction experiences a retry error. In that case, the
-	// coordinator uses the Refresh and RefreshRange RPCs to verify that
-	// no write has occurred to the spans more recently than the txn's
-	// original timestamp, and updates the affected timestamp caches to
-	// the transaction's refreshed timestamp. On failure, the retry
-	// error is propagated. On success, the transaction's original and
-	// current timestamps are forwarded to the refresh timestamp, and
-	// the transaction can continue.
-	RefreshReads  []Span `protobuf:"bytes,4,rep,name=refresh_reads,json=refreshReads,proto3" json:"refresh_reads"`
-	RefreshWrites []Span `protobuf:"bytes,5,rep,name=refresh_writes,json=refreshWrites,proto3" json:"refresh_writes"`
-	// refresh_invalid indicates that spans were discarded or not collected
-	// (i.e. because of a dist SQL processor running a version before refreshing
-	// was introduced). This is false if all spans encountered during the
-	// transaction which need refreshing have been collected to the refresh_reads
-	// and refresh_writes span slices.
+	// refresh_invalid indicates that the root txn is not
+	// collecting refresh spans so the leaf should also avoid
+	// collecting them. This is an optimization: it avoids
+	// the collection work in that cases and also possibly
+	// reduces memory usage.
 	RefreshInvalid bool `protobuf:"varint,7,opt,name=refresh_invalid,json=refreshInvalid,proto3" json:"refresh_invalid,omitempty"`
-	// deprecated_refresh_valid is the inverse of refresh_invalid. It was
-	// deprecated in favor of refresh_invalid in order to give the struct a useful
-	// zero value.
-	// TODO(nvanbenschoten): Can be removed in 2.2.
-	DeprecatedRefreshValid bool `protobuf:"varint,6,opt,name=deprecated_refresh_valid,json=deprecatedRefreshValid,proto3" json:"deprecated_refresh_valid,omitempty"`
-	// outstanding_writes stores all writes that are outstanding and have
-	// not yet been resolved. Any client wishing to send a request that
-	// overlaps with them must chain on to their success using a QueryIntent
-	// request.
-	OutstandingWrites    []SequencedWrite `protobuf:"bytes,8,rep,name=outstanding_writes,json=outstandingWrites,proto3" json:"outstanding_writes"`
-	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
-	XXX_sizecache        int32            `json:"-"`
+	// in_flight_writes stores all writes that are in-flight and have not yet
+	// been proven to have succeeded. Overlapping requests must chain on to
+	// their success using a QueryIntent request.
+	InFlightWrites []SequencedWrite `protobuf:"bytes,8,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
+	// Whether stepping mode is enabled. False indicates synchronous
+	// read-own-writes, where every KV read is able to observe the
+	// latest writes. True indicates that KV reads should be done at the
+	// read_seq_num specified below.
+	SteppingModeEnabled bool `protobuf:"varint,9,opt,name=stepping_mode_enabled,json=steppingModeEnabled,proto3" json:"stepping_mode_enabled,omitempty"`
+	// Current read seqnum. When stepping_mode_enabled is true,
+	// this field becomes the sequence number used for reads,
+	// regardless of the current seqnum generated for writes. This is
+	// updated via the (client.TxnSender).Step() operation.
+	ReadSeqNum github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnSeq `protobuf:"varint,10,opt,name=read_seq_num,json=readSeqNum,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/enginepb.TxnSeq" json:"read_seq_num,omitempty"`
 }
 
-func (m *TxnCoordMeta) Reset()         { *m = TxnCoordMeta{} }
-func (m *TxnCoordMeta) String() string { return proto.CompactTextString(m) }
-func (*TxnCoordMeta) ProtoMessage()    {}
-func (*TxnCoordMeta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_54ebeb3253c73ae1, []int{16}
+func (m *LeafTxnInputState) Reset()         { *m = LeafTxnInputState{} }
+func (m *LeafTxnInputState) String() string { return proto.CompactTextString(m) }
+func (*LeafTxnInputState) ProtoMessage()    {}
+func (*LeafTxnInputState) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{19}
 }
-func (m *TxnCoordMeta) XXX_Unmarshal(b []byte) error {
+func (m *LeafTxnInputState) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TxnCoordMeta) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *LeafTxnInputState) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -1059,17 +1322,105 @@ func (m *TxnCoordMeta) XXX_Marshal(b []byte, deterministic bool) ([]byte, error)
 	}
 	return b[:n], nil
 }
-func (dst *TxnCoordMeta) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TxnCoordMeta.Merge(dst, src)
+func (dst *LeafTxnInputState) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_LeafTxnInputState.Merge(dst, src)
 }
-func (m *TxnCoordMeta) XXX_Size() int {
+func (m *LeafTxnInputState) XXX_Size() int {
 	return m.Size()
 }
-func (m *TxnCoordMeta) XXX_DiscardUnknown() {
-	xxx_messageInfo_TxnCoordMeta.DiscardUnknown(m)
+func (m *LeafTxnInputState) XXX_DiscardUnknown() {
+	xxx_messageInfo_LeafTxnInputState.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TxnCoordMeta proto.InternalMessageInfo
+var xxx_messageInfo_LeafTxnInputState proto.InternalMessageInfo
+
+// LeafTxnFinalState is the state from a leaf transaction coordinator
+// necessary and sufficient to update a RootTxn on the gateway
+// coordinator.
+type LeafTxnFinalState struct {
+	// txn is a copy of the transaction record.
+	// TODO(knz,andrei): We don't actually need the fully txn
+	// record. This can be simplified.
+	// See: https://github.com/cockroachdb/cockroach/issues/43192
+	Txn Transaction `protobuf:"bytes,1,opt,name=txn,proto3" json:"txn"`
+	// deprecated_command_count indicates that at least one request
+	// has been processed in this transaction.
+	// Populated only for compatibility with pre-20.1 nodes.
+	// TODO(knz,andrei): Remove this in 20.2.
+	DeprecatedCommandCount int32 `protobuf:"varint,3,opt,name=deprecated_command_count,json=deprecatedCommandCount,proto3" json:"deprecated_command_count,omitempty"`
+	// refresh_spans contains the key spans read by the leaf. The root will add
+	// them to its own tracking of reads.
+	RefreshSpans []Span `protobuf:"bytes,4,rep,name=refresh_spans,json=refreshSpans,proto3" json:"refresh_spans"`
+	// refresh_invalid is set if refresh spans have not been collected. In this
+	// case, refresh_spans is empty. It may be set because the leaf was asked not
+	// to collect spans or because the leaf's reads exceeded the tracking memory
+	// budget.
+	RefreshInvalid bool `protobuf:"varint,7,opt,name=refresh_invalid,json=refreshInvalid,proto3" json:"refresh_invalid,omitempty"`
+}
+
+func (m *LeafTxnFinalState) Reset()         { *m = LeafTxnFinalState{} }
+func (m *LeafTxnFinalState) String() string { return proto.CompactTextString(m) }
+func (*LeafTxnFinalState) ProtoMessage()    {}
+func (*LeafTxnFinalState) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{20}
+}
+func (m *LeafTxnFinalState) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *LeafTxnFinalState) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *LeafTxnFinalState) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_LeafTxnFinalState.Merge(dst, src)
+}
+func (m *LeafTxnFinalState) XXX_Size() int {
+	return m.Size()
+}
+func (m *LeafTxnFinalState) XXX_DiscardUnknown() {
+	xxx_messageInfo_LeafTxnFinalState.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_LeafTxnFinalState proto.InternalMessageInfo
+
+// RangeInfo describes a range which executed a request. It contains
+// the range descriptor and lease information at the time of execution.
+type RangeInfo struct {
+	Desc  RangeDescriptor `protobuf:"bytes,1,opt,name=desc,proto3" json:"desc"`
+	Lease Lease           `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease"`
+}
+
+func (m *RangeInfo) Reset()      { *m = RangeInfo{} }
+func (*RangeInfo) ProtoMessage() {}
+func (*RangeInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_data_d5d4f0921acc3a01, []int{21}
+}
+func (m *RangeInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RangeInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RangeInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RangeInfo.Merge(dst, src)
+}
+func (m *RangeInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *RangeInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_RangeInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RangeInfo proto.InternalMessageInfo
 
 func init() {
 	proto.RegisterType((*Span)(nil), "cockroach.roachpb.Span")
@@ -1080,15 +1431,21 @@ func init() {
 	proto.RegisterType((*MergeTrigger)(nil), "cockroach.roachpb.MergeTrigger")
 	proto.RegisterType((*ChangeReplicasTrigger)(nil), "cockroach.roachpb.ChangeReplicasTrigger")
 	proto.RegisterType((*ModifiedSpanTrigger)(nil), "cockroach.roachpb.ModifiedSpanTrigger")
+	proto.RegisterType((*StickyBitTrigger)(nil), "cockroach.roachpb.StickyBitTrigger")
 	proto.RegisterType((*InternalCommitTrigger)(nil), "cockroach.roachpb.InternalCommitTrigger")
 	proto.RegisterType((*ObservedTimestamp)(nil), "cockroach.roachpb.ObservedTimestamp")
 	proto.RegisterType((*Transaction)(nil), "cockroach.roachpb.Transaction")
 	proto.RegisterType((*TransactionRecord)(nil), "cockroach.roachpb.TransactionRecord")
 	proto.RegisterType((*Intent)(nil), "cockroach.roachpb.Intent")
+	proto.RegisterType((*Intent_SingleKeySpan)(nil), "cockroach.roachpb.Intent.SingleKeySpan")
+	proto.RegisterType((*LockAcquisition)(nil), "cockroach.roachpb.LockAcquisition")
+	proto.RegisterType((*LockUpdate)(nil), "cockroach.roachpb.LockUpdate")
 	proto.RegisterType((*SequencedWrite)(nil), "cockroach.roachpb.SequencedWrite")
 	proto.RegisterType((*Lease)(nil), "cockroach.roachpb.Lease")
 	proto.RegisterType((*AbortSpanEntry)(nil), "cockroach.roachpb.AbortSpanEntry")
-	proto.RegisterType((*TxnCoordMeta)(nil), "cockroach.roachpb.TxnCoordMeta")
+	proto.RegisterType((*LeafTxnInputState)(nil), "cockroach.roachpb.LeafTxnInputState")
+	proto.RegisterType((*LeafTxnFinalState)(nil), "cockroach.roachpb.LeafTxnFinalState")
+	proto.RegisterType((*RangeInfo)(nil), "cockroach.roachpb.RangeInfo")
 	proto.RegisterEnum("cockroach.roachpb.ValueType", ValueType_name, ValueType_value)
 	proto.RegisterEnum("cockroach.roachpb.ReplicaChangeType", ReplicaChangeType_name, ReplicaChangeType_value)
 	proto.RegisterEnum("cockroach.roachpb.TransactionStatus", TransactionStatus_name, TransactionStatus_value)
@@ -1226,22 +1583,41 @@ func (this *ChangeReplicasTrigger) Equal(that interface{}) bool {
 	} else if this == nil {
 		return false
 	}
-	if this.ChangeType != that1.ChangeType {
+	if this.DeprecatedChangeType != that1.DeprecatedChangeType {
 		return false
 	}
-	if !this.Replica.Equal(&that1.Replica) {
+	if !this.DeprecatedReplica.Equal(&that1.DeprecatedReplica) {
 		return false
 	}
-	if len(this.UpdatedReplicas) != len(that1.UpdatedReplicas) {
+	if len(this.DeprecatedUpdatedReplicas) != len(that1.DeprecatedUpdatedReplicas) {
 		return false
 	}
-	for i := range this.UpdatedReplicas {
-		if !this.UpdatedReplicas[i].Equal(&that1.UpdatedReplicas[i]) {
+	for i := range this.DeprecatedUpdatedReplicas {
+		if !this.DeprecatedUpdatedReplicas[i].Equal(&that1.DeprecatedUpdatedReplicas[i]) {
 			return false
 		}
 	}
-	if this.NextReplicaID != that1.NextReplicaID {
+	if this.DeprecatedNextReplicaID != that1.DeprecatedNextReplicaID {
 		return false
+	}
+	if !this.Desc.Equal(that1.Desc) {
+		return false
+	}
+	if len(this.InternalAddedReplicas) != len(that1.InternalAddedReplicas) {
+		return false
+	}
+	for i := range this.InternalAddedReplicas {
+		if !this.InternalAddedReplicas[i].Equal(&that1.InternalAddedReplicas[i]) {
+			return false
+		}
+	}
+	if len(this.InternalRemovedReplicas) != len(that1.InternalRemovedReplicas) {
+		return false
+	}
+	for i := range this.InternalRemovedReplicas {
+		if !this.InternalRemovedReplicas[i].Equal(&that1.InternalRemovedReplicas[i]) {
+			return false
+		}
 	}
 	return true
 }
@@ -1268,6 +1644,30 @@ func (this *ModifiedSpanTrigger) Equal(that interface{}) bool {
 		return false
 	}
 	if !this.NodeLivenessSpan.Equal(that1.NodeLivenessSpan) {
+		return false
+	}
+	return true
+}
+func (this *StickyBitTrigger) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*StickyBitTrigger)
+	if !ok {
+		that2, ok := that.(StickyBitTrigger)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.StickyBit.Equal(&that1.StickyBit) {
 		return false
 	}
 	return true
@@ -1301,6 +1701,9 @@ func (this *InternalCommitTrigger) Equal(that interface{}) bool {
 		return false
 	}
 	if !this.ModifiedSpanTrigger.Equal(that1.ModifiedSpanTrigger) {
+		return false
+	}
+	if !this.StickyBitTrigger.Equal(that1.StickyBitTrigger) {
 		return false
 	}
 	return true
@@ -1363,13 +1766,13 @@ func (this *Transaction) Equal(that interface{}) bool {
 	if !this.LastHeartbeat.Equal(&that1.LastHeartbeat) {
 		return false
 	}
-	if !this.OrigTimestamp.Equal(&that1.OrigTimestamp) {
+	if this.CommitTimestampFixed != that1.CommitTimestampFixed {
+		return false
+	}
+	if !this.ReadTimestamp.Equal(&that1.ReadTimestamp) {
 		return false
 	}
 	if !this.MaxTimestamp.Equal(&that1.MaxTimestamp) {
-		return false
-	}
-	if !this.RefreshedTimestamp.Equal(&that1.RefreshedTimestamp) {
 		return false
 	}
 	if len(this.ObservedTimestamps) != len(that1.ObservedTimestamps) {
@@ -1380,25 +1783,32 @@ func (this *Transaction) Equal(that interface{}) bool {
 			return false
 		}
 	}
-	if this.Writing != that1.Writing {
-		return false
-	}
 	if this.WriteTooOld != that1.WriteTooOld {
 		return false
 	}
-	if len(this.Intents) != len(that1.Intents) {
+	if len(this.LockSpans) != len(that1.LockSpans) {
 		return false
 	}
-	for i := range this.Intents {
-		if !this.Intents[i].Equal(&that1.Intents[i]) {
+	for i := range this.LockSpans {
+		if !this.LockSpans[i].Equal(&that1.LockSpans[i]) {
 			return false
 		}
 	}
-	if !this.EpochZeroTimestamp.Equal(&that1.EpochZeroTimestamp) {
+	if len(this.InFlightWrites) != len(that1.InFlightWrites) {
 		return false
 	}
-	if this.OrigTimestampWasObserved != that1.OrigTimestampWasObserved {
+	for i := range this.InFlightWrites {
+		if !this.InFlightWrites[i].Equal(&that1.InFlightWrites[i]) {
+			return false
+		}
+	}
+	if len(this.IgnoredSeqNums) != len(that1.IgnoredSeqNums) {
 		return false
+	}
+	for i := range this.IgnoredSeqNums {
+		if !this.IgnoredSeqNums[i].Equal(&that1.IgnoredSeqNums[i]) {
+			return false
+		}
 	}
 	return true
 }
@@ -1430,11 +1840,27 @@ func (this *TransactionRecord) Equal(that interface{}) bool {
 	if !this.LastHeartbeat.Equal(&that1.LastHeartbeat) {
 		return false
 	}
-	if len(this.Intents) != len(that1.Intents) {
+	if len(this.LockSpans) != len(that1.LockSpans) {
 		return false
 	}
-	for i := range this.Intents {
-		if !this.Intents[i].Equal(&that1.Intents[i]) {
+	for i := range this.LockSpans {
+		if !this.LockSpans[i].Equal(&that1.LockSpans[i]) {
+			return false
+		}
+	}
+	if len(this.InFlightWrites) != len(that1.InFlightWrites) {
+		return false
+	}
+	for i := range this.InFlightWrites {
+		if !this.InFlightWrites[i].Equal(&that1.InFlightWrites[i]) {
+			return false
+		}
+	}
+	if len(this.IgnoredSeqNums) != len(that1.IgnoredSeqNums) {
+		return false
+	}
+	for i := range this.IgnoredSeqNums {
+		if !this.IgnoredSeqNums[i].Equal(&that1.IgnoredSeqNums[i]) {
 			return false
 		}
 	}
@@ -1459,6 +1885,87 @@ func (this *Intent) Equal(that interface{}) bool {
 	} else if this == nil {
 		return false
 	}
+	if !this.Intent_SingleKeySpan.Equal(&that1.Intent_SingleKeySpan) {
+		return false
+	}
+	if !this.Txn.Equal(&that1.Txn) {
+		return false
+	}
+	return true
+}
+func (this *Intent_SingleKeySpan) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*Intent_SingleKeySpan)
+	if !ok {
+		that2, ok := that.(Intent_SingleKeySpan)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !bytes.Equal(this.Key, that1.Key) {
+		return false
+	}
+	return true
+}
+func (this *LockAcquisition) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*LockAcquisition)
+	if !ok {
+		that2, ok := that.(LockAcquisition)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Span.Equal(&that1.Span) {
+		return false
+	}
+	if !this.Txn.Equal(&that1.Txn) {
+		return false
+	}
+	if this.Durability != that1.Durability {
+		return false
+	}
+	return true
+}
+func (this *LockUpdate) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*LockUpdate)
+	if !ok {
+		that2, ok := that.(LockUpdate)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
 	if !this.Span.Equal(&that1.Span) {
 		return false
 	}
@@ -1466,6 +1973,41 @@ func (this *Intent) Equal(that interface{}) bool {
 		return false
 	}
 	if this.Status != that1.Status {
+		return false
+	}
+	if len(this.IgnoredSeqNums) != len(that1.IgnoredSeqNums) {
+		return false
+	}
+	for i := range this.IgnoredSeqNums {
+		if !this.IgnoredSeqNums[i].Equal(&that1.IgnoredSeqNums[i]) {
+			return false
+		}
+	}
+	return true
+}
+func (this *SequencedWrite) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*SequencedWrite)
+	if !ok {
+		that2, ok := that.(SequencedWrite)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !bytes.Equal(this.Key, that1.Key) {
+		return false
+	}
+	if this.Sequence != that1.Sequence {
 		return false
 	}
 	return true
@@ -1496,6 +2038,33 @@ func (this *AbortSpanEntry) Equal(that interface{}) bool {
 		return false
 	}
 	if this.Priority != that1.Priority {
+		return false
+	}
+	return true
+}
+func (this *RangeInfo) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*RangeInfo)
+	if !ok {
+		that2, ok := that.(RangeInfo)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Desc.Equal(&that1.Desc) {
+		return false
+	}
+	if !this.Lease.Equal(&that1.Lease) {
 		return false
 	}
 	return true
@@ -1729,21 +2298,21 @@ func (m *ChangeReplicasTrigger) MarshalTo(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.ChangeType != 0 {
+	if m.DeprecatedChangeType != 0 {
 		dAtA[i] = 0x8
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ChangeType))
+		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedChangeType))
 	}
 	dAtA[i] = 0x12
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.Replica.Size()))
-	n10, err := m.Replica.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.DeprecatedReplica.Size()))
+	n10, err := m.DeprecatedReplica.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n10
-	if len(m.UpdatedReplicas) > 0 {
-		for _, msg := range m.UpdatedReplicas {
+	if len(m.DeprecatedUpdatedReplicas) > 0 {
+		for _, msg := range m.DeprecatedUpdatedReplicas {
 			dAtA[i] = 0x1a
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
@@ -1754,10 +2323,44 @@ func (m *ChangeReplicasTrigger) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
-	if m.NextReplicaID != 0 {
+	if m.DeprecatedNextReplicaID != 0 {
 		dAtA[i] = 0x20
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.NextReplicaID))
+		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedNextReplicaID))
+	}
+	if m.Desc != nil {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.Desc.Size()))
+		n11, err := m.Desc.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n11
+	}
+	if len(m.InternalAddedReplicas) > 0 {
+		for _, msg := range m.InternalAddedReplicas {
+			dAtA[i] = 0x32
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.InternalRemovedReplicas) > 0 {
+		for _, msg := range m.InternalRemovedReplicas {
+			dAtA[i] = 0x3a
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
@@ -1791,12 +2394,38 @@ func (m *ModifiedSpanTrigger) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.NodeLivenessSpan.Size()))
-		n11, err := m.NodeLivenessSpan.MarshalTo(dAtA[i:])
+		n12, err := m.NodeLivenessSpan.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n11
+		i += n12
 	}
+	return i, nil
+}
+
+func (m *StickyBitTrigger) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StickyBitTrigger) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.StickyBit.Size()))
+	n13, err := m.StickyBit.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n13
 	return i, nil
 }
 
@@ -1819,41 +2448,51 @@ func (m *InternalCommitTrigger) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.SplitTrigger.Size()))
-		n12, err := m.SplitTrigger.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n12
-	}
-	if m.MergeTrigger != nil {
-		dAtA[i] = 0x12
-		i++
-		i = encodeVarintData(dAtA, i, uint64(m.MergeTrigger.Size()))
-		n13, err := m.MergeTrigger.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n13
-	}
-	if m.ChangeReplicasTrigger != nil {
-		dAtA[i] = 0x1a
-		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ChangeReplicasTrigger.Size()))
-		n14, err := m.ChangeReplicasTrigger.MarshalTo(dAtA[i:])
+		n14, err := m.SplitTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n14
 	}
-	if m.ModifiedSpanTrigger != nil {
-		dAtA[i] = 0x22
+	if m.MergeTrigger != nil {
+		dAtA[i] = 0x12
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ModifiedSpanTrigger.Size()))
-		n15, err := m.ModifiedSpanTrigger.MarshalTo(dAtA[i:])
+		i = encodeVarintData(dAtA, i, uint64(m.MergeTrigger.Size()))
+		n15, err := m.MergeTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n15
+	}
+	if m.ChangeReplicasTrigger != nil {
+		dAtA[i] = 0x1a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.ChangeReplicasTrigger.Size()))
+		n16, err := m.ChangeReplicasTrigger.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n16
+	}
+	if m.ModifiedSpanTrigger != nil {
+		dAtA[i] = 0x22
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.ModifiedSpanTrigger.Size()))
+		n17, err := m.ModifiedSpanTrigger.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n17
+	}
+	if m.StickyBitTrigger != nil {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.StickyBitTrigger.Size()))
+		n18, err := m.StickyBitTrigger.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n18
 	}
 	return i, nil
 }
@@ -1881,11 +2520,11 @@ func (m *ObservedTimestamp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Timestamp.Size()))
-	n16, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n19, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n16
+	i += n19
 	return i, nil
 }
 
@@ -1907,11 +2546,11 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.TxnMeta.Size()))
-	n17, err := m.TxnMeta.MarshalTo(dAtA[i:])
+	n20, err := m.TxnMeta.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n17
+	i += n20
 	if len(m.Name) > 0 {
 		dAtA[i] = 0x12
 		i++
@@ -1926,27 +2565,19 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x2a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.LastHeartbeat.Size()))
-	n18, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
+	n21, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n18
-	dAtA[i] = 0x32
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.OrigTimestamp.Size()))
-	n19, err := m.OrigTimestamp.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n19
+	i += n21
 	dAtA[i] = 0x3a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.MaxTimestamp.Size()))
-	n20, err := m.MaxTimestamp.MarshalTo(dAtA[i:])
+	n22, err := m.MaxTimestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n20
+	i += n22
 	if len(m.ObservedTimestamps) > 0 {
 		for _, msg := range m.ObservedTimestamps {
 			dAtA[i] = 0x42
@@ -1959,18 +2590,8 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
-	if m.Writing {
-		dAtA[i] = 0x48
-		i++
-		if m.Writing {
-			dAtA[i] = 1
-		} else {
-			dAtA[i] = 0
-		}
-		i++
-	}
-	if len(m.Intents) > 0 {
-		for _, msg := range m.Intents {
+	if len(m.LockSpans) > 0 {
+		for _, msg := range m.LockSpans {
 			dAtA[i] = 0x5a
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
@@ -1991,33 +2612,53 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 		}
 		i++
 	}
-	dAtA[i] = 0x72
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.EpochZeroTimestamp.Size()))
-	n21, err := m.EpochZeroTimestamp.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n21
 	dAtA[i] = 0x7a
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.RefreshedTimestamp.Size()))
-	n22, err := m.RefreshedTimestamp.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.ReadTimestamp.Size()))
+	n23, err := m.ReadTimestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n22
-	if m.OrigTimestampWasObserved {
+	i += n23
+	if m.CommitTimestampFixed {
 		dAtA[i] = 0x80
 		i++
 		dAtA[i] = 0x1
 		i++
-		if m.OrigTimestampWasObserved {
+		if m.CommitTimestampFixed {
 			dAtA[i] = 1
 		} else {
 			dAtA[i] = 0
 		}
 		i++
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, msg := range m.InFlightWrites {
+			dAtA[i] = 0x8a
+			i++
+			dAtA[i] = 0x1
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, msg := range m.IgnoredSeqNums {
+			dAtA[i] = 0x92
+			i++
+			dAtA[i] = 0x1
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
@@ -2040,11 +2681,11 @@ func (m *TransactionRecord) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.TxnMeta.Size()))
-	n23, err := m.TxnMeta.MarshalTo(dAtA[i:])
+	n24, err := m.TxnMeta.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n23
+	i += n24
 	if m.Status != 0 {
 		dAtA[i] = 0x20
 		i++
@@ -2053,14 +2694,42 @@ func (m *TransactionRecord) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x2a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.LastHeartbeat.Size()))
-	n24, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
+	n25, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n24
-	if len(m.Intents) > 0 {
-		for _, msg := range m.Intents {
+	i += n25
+	if len(m.LockSpans) > 0 {
+		for _, msg := range m.LockSpans {
 			dAtA[i] = 0x5a
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, msg := range m.InFlightWrites {
+			dAtA[i] = 0x8a
+			i++
+			dAtA[i] = 0x1
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, msg := range m.IgnoredSeqNums {
+			dAtA[i] = 0x92
+			i++
+			dAtA[i] = 0x1
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
 			n, err := msg.MarshalTo(dAtA[i:])
@@ -2090,24 +2759,133 @@ func (m *Intent) MarshalTo(dAtA []byte) (int, error) {
 	_ = l
 	dAtA[i] = 0xa
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.Span.Size()))
-	n25, err := m.Span.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n25
-	dAtA[i] = 0x12
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
-	n26, err := m.Txn.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.Intent_SingleKeySpan.Size()))
+	n26, err := m.Intent_SingleKeySpan.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n26
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
+	n27, err := m.Txn.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n27
+	return i, nil
+}
+
+func (m *Intent_SingleKeySpan) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *Intent_SingleKeySpan) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Key) > 0 {
+		dAtA[i] = 0x1a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(len(m.Key)))
+		i += copy(dAtA[i:], m.Key)
+	}
+	return i, nil
+}
+
+func (m *LockAcquisition) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *LockAcquisition) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Span.Size()))
+	n28, err := m.Span.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n28
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
+	n29, err := m.Txn.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n29
+	if m.Durability != 0 {
+		dAtA[i] = 0x18
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.Durability))
+	}
+	return i, nil
+}
+
+func (m *LockUpdate) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *LockUpdate) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Span.Size()))
+	n30, err := m.Span.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n30
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
+	n31, err := m.Txn.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n31
 	if m.Status != 0 {
 		dAtA[i] = 0x18
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.Status))
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, msg := range m.IgnoredSeqNums {
+			dAtA[i] = 0x22
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
@@ -2159,48 +2937,48 @@ func (m *Lease) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Start.Size()))
-	n27, err := m.Start.MarshalTo(dAtA[i:])
+	n32, err := m.Start.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n27
+	i += n32
 	if m.Expiration != nil {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.Expiration.Size()))
-		n28, err := m.Expiration.MarshalTo(dAtA[i:])
+		n33, err := m.Expiration.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n28
+		i += n33
 	}
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Replica.Size()))
-	n29, err := m.Replica.MarshalTo(dAtA[i:])
+	n34, err := m.Replica.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n29
+	i += n34
 	if m.DeprecatedStartStasis != nil {
 		dAtA[i] = 0x22
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedStartStasis.Size()))
-		n30, err := m.DeprecatedStartStasis.MarshalTo(dAtA[i:])
+		n35, err := m.DeprecatedStartStasis.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n30
+		i += n35
 	}
 	if m.ProposedTS != nil {
 		dAtA[i] = 0x2a
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.ProposedTS.Size()))
-		n31, err := m.ProposedTS.MarshalTo(dAtA[i:])
+		n36, err := m.ProposedTS.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n31
+		i += n36
 	}
 	if m.Epoch != 0 {
 		dAtA[i] = 0x30
@@ -2239,11 +3017,11 @@ func (m *AbortSpanEntry) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Timestamp.Size()))
-	n32, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n37, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n32
+	i += n37
 	if m.Priority != 0 {
 		dAtA[i] = 0x18
 		i++
@@ -2252,7 +3030,7 @@ func (m *AbortSpanEntry) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
-func (m *TxnCoordMeta) Marshal() (dAtA []byte, err error) {
+func (m *LeafTxnInputState) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -2262,7 +3040,7 @@ func (m *TxnCoordMeta) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TxnCoordMeta) MarshalTo(dAtA []byte) (int, error) {
+func (m *LeafTxnInputState) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -2270,14 +3048,24 @@ func (m *TxnCoordMeta) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
-	n33, err := m.Txn.MarshalTo(dAtA[i:])
+	n38, err := m.Txn.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n33
-	if len(m.Intents) > 0 {
-		for _, msg := range m.Intents {
-			dAtA[i] = 0x12
+	i += n38
+	if m.RefreshInvalid {
+		dAtA[i] = 0x38
+		i++
+		if m.RefreshInvalid {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, msg := range m.InFlightWrites {
+			dAtA[i] = 0x42
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
 			n, err := msg.MarshalTo(dAtA[i:])
@@ -2287,13 +3075,54 @@ func (m *TxnCoordMeta) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
-	if m.CommandCount != 0 {
+	if m.SteppingModeEnabled {
+		dAtA[i] = 0x48
+		i++
+		if m.SteppingModeEnabled {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	if m.ReadSeqNum != 0 {
+		dAtA[i] = 0x50
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.ReadSeqNum))
+	}
+	return i, nil
+}
+
+func (m *LeafTxnFinalState) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *LeafTxnFinalState) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Txn.Size()))
+	n39, err := m.Txn.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n39
+	if m.DeprecatedCommandCount != 0 {
 		dAtA[i] = 0x18
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.CommandCount))
+		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedCommandCount))
 	}
-	if len(m.RefreshReads) > 0 {
-		for _, msg := range m.RefreshReads {
+	if len(m.RefreshSpans) > 0 {
+		for _, msg := range m.RefreshSpans {
 			dAtA[i] = 0x22
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
@@ -2303,28 +3132,6 @@ func (m *TxnCoordMeta) MarshalTo(dAtA []byte) (int, error) {
 			}
 			i += n
 		}
-	}
-	if len(m.RefreshWrites) > 0 {
-		for _, msg := range m.RefreshWrites {
-			dAtA[i] = 0x2a
-			i++
-			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if m.DeprecatedRefreshValid {
-		dAtA[i] = 0x30
-		i++
-		if m.DeprecatedRefreshValid {
-			dAtA[i] = 1
-		} else {
-			dAtA[i] = 0
-		}
-		i++
 	}
 	if m.RefreshInvalid {
 		dAtA[i] = 0x38
@@ -2336,18 +3143,40 @@ func (m *TxnCoordMeta) MarshalTo(dAtA []byte) (int, error) {
 		}
 		i++
 	}
-	if len(m.OutstandingWrites) > 0 {
-		for _, msg := range m.OutstandingWrites {
-			dAtA[i] = 0x42
-			i++
-			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
+	return i, nil
+}
+
+func (m *RangeInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
 	}
+	return dAtA[:n], nil
+}
+
+func (m *RangeInfo) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Desc.Size()))
+	n40, err := m.Desc.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n40
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.Lease.Size()))
+	n41, err := m.Lease.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n41
 	return i, nil
 }
 
@@ -2395,36 +3224,47 @@ func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 	v4 := enginepb.NewPopulatedTxnMeta(r, easy)
 	this.TxnMeta = *v4
 	this.Name = string(randStringData(r))
-	this.Status = TransactionStatus([]int32{0, 1, 2}[r.Intn(3)])
+	this.Status = TransactionStatus([]int32{0, 3, 1, 2}[r.Intn(4)])
 	v5 := hlc.NewPopulatedTimestamp(r, easy)
 	this.LastHeartbeat = *v5
 	v6 := hlc.NewPopulatedTimestamp(r, easy)
-	this.OrigTimestamp = *v6
-	v7 := hlc.NewPopulatedTimestamp(r, easy)
-	this.MaxTimestamp = *v7
+	this.MaxTimestamp = *v6
 	if r.Intn(10) != 0 {
-		v8 := r.Intn(5)
-		this.ObservedTimestamps = make([]ObservedTimestamp, v8)
-		for i := 0; i < v8; i++ {
-			v9 := NewPopulatedObservedTimestamp(r, easy)
-			this.ObservedTimestamps[i] = *v9
+		v7 := r.Intn(5)
+		this.ObservedTimestamps = make([]ObservedTimestamp, v7)
+		for i := 0; i < v7; i++ {
+			v8 := NewPopulatedObservedTimestamp(r, easy)
+			this.ObservedTimestamps[i] = *v8
 		}
 	}
-	this.Writing = bool(bool(r.Intn(2) == 0))
 	if r.Intn(10) != 0 {
-		v10 := r.Intn(5)
-		this.Intents = make([]Span, v10)
-		for i := 0; i < v10; i++ {
-			v11 := NewPopulatedSpan(r, easy)
-			this.Intents[i] = *v11
+		v9 := r.Intn(5)
+		this.LockSpans = make([]Span, v9)
+		for i := 0; i < v9; i++ {
+			v10 := NewPopulatedSpan(r, easy)
+			this.LockSpans[i] = *v10
 		}
 	}
 	this.WriteTooOld = bool(bool(r.Intn(2) == 0))
-	v12 := hlc.NewPopulatedTimestamp(r, easy)
-	this.EpochZeroTimestamp = *v12
-	v13 := hlc.NewPopulatedTimestamp(r, easy)
-	this.RefreshedTimestamp = *v13
-	this.OrigTimestampWasObserved = bool(bool(r.Intn(2) == 0))
+	v11 := hlc.NewPopulatedTimestamp(r, easy)
+	this.ReadTimestamp = *v11
+	this.CommitTimestampFixed = bool(bool(r.Intn(2) == 0))
+	if r.Intn(10) != 0 {
+		v12 := r.Intn(5)
+		this.InFlightWrites = make([]SequencedWrite, v12)
+		for i := 0; i < v12; i++ {
+			v13 := NewPopulatedSequencedWrite(r, easy)
+			this.InFlightWrites[i] = *v13
+		}
+	}
+	if r.Intn(10) != 0 {
+		v14 := r.Intn(5)
+		this.IgnoredSeqNums = make([]enginepb.IgnoredSeqNumRange, v14)
+		for i := 0; i < v14; i++ {
+			v15 := enginepb.NewPopulatedIgnoredSeqNumRange(r, easy)
+			this.IgnoredSeqNums[i] = *v15
+		}
+	}
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -2432,18 +3272,50 @@ func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 
 func NewPopulatedTransactionRecord(r randyData, easy bool) *TransactionRecord {
 	this := &TransactionRecord{}
-	v14 := enginepb.NewPopulatedTxnMeta(r, easy)
-	this.TxnMeta = *v14
-	this.Status = TransactionStatus([]int32{0, 1, 2}[r.Intn(3)])
-	v15 := hlc.NewPopulatedTimestamp(r, easy)
-	this.LastHeartbeat = *v15
+	v16 := enginepb.NewPopulatedTxnMeta(r, easy)
+	this.TxnMeta = *v16
+	this.Status = TransactionStatus([]int32{0, 3, 1, 2}[r.Intn(4)])
+	v17 := hlc.NewPopulatedTimestamp(r, easy)
+	this.LastHeartbeat = *v17
 	if r.Intn(10) != 0 {
-		v16 := r.Intn(5)
-		this.Intents = make([]Span, v16)
-		for i := 0; i < v16; i++ {
-			v17 := NewPopulatedSpan(r, easy)
-			this.Intents[i] = *v17
+		v18 := r.Intn(5)
+		this.LockSpans = make([]Span, v18)
+		for i := 0; i < v18; i++ {
+			v19 := NewPopulatedSpan(r, easy)
+			this.LockSpans[i] = *v19
 		}
+	}
+	if r.Intn(10) != 0 {
+		v20 := r.Intn(5)
+		this.InFlightWrites = make([]SequencedWrite, v20)
+		for i := 0; i < v20; i++ {
+			v21 := NewPopulatedSequencedWrite(r, easy)
+			this.InFlightWrites[i] = *v21
+		}
+	}
+	if r.Intn(10) != 0 {
+		v22 := r.Intn(5)
+		this.IgnoredSeqNums = make([]enginepb.IgnoredSeqNumRange, v22)
+		for i := 0; i < v22; i++ {
+			v23 := enginepb.NewPopulatedIgnoredSeqNumRange(r, easy)
+			this.IgnoredSeqNums[i] = *v23
+		}
+	}
+	if !easy && r.Intn(10) != 0 {
+	}
+	return this
+}
+
+func NewPopulatedSequencedWrite(r randyData, easy bool) *SequencedWrite {
+	this := &SequencedWrite{}
+	v24 := r.Intn(100)
+	this.Key = make(Key, v24)
+	for i := 0; i < v24; i++ {
+		this.Key[i] = byte(r.Intn(256))
+	}
+	this.Sequence = github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnSeq(r.Int31())
+	if r.Intn(2) == 0 {
+		this.Sequence *= -1
 	}
 	if !easy && r.Intn(10) != 0 {
 	}
@@ -2452,13 +3324,13 @@ func NewPopulatedTransactionRecord(r randyData, easy bool) *TransactionRecord {
 
 func NewPopulatedLease(r randyData, easy bool) *Lease {
 	this := &Lease{}
-	v18 := hlc.NewPopulatedTimestamp(r, easy)
-	this.Start = *v18
+	v25 := hlc.NewPopulatedTimestamp(r, easy)
+	this.Start = *v25
 	if r.Intn(10) != 0 {
 		this.Expiration = hlc.NewPopulatedTimestamp(r, easy)
 	}
-	v19 := NewPopulatedReplicaDescriptor(r, easy)
-	this.Replica = *v19
+	v26 := NewPopulatedReplicaDescriptor(r, easy)
+	this.Replica = *v26
 	if r.Intn(10) != 0 {
 		this.DeprecatedStartStasis = hlc.NewPopulatedTimestamp(r, easy)
 	}
@@ -2480,14 +3352,14 @@ func NewPopulatedLease(r randyData, easy bool) *Lease {
 
 func NewPopulatedAbortSpanEntry(r randyData, easy bool) *AbortSpanEntry {
 	this := &AbortSpanEntry{}
-	v20 := r.Intn(100)
-	this.Key = make(Key, v20)
-	for i := 0; i < v20; i++ {
+	v27 := r.Intn(100)
+	this.Key = make(Key, v27)
+	for i := 0; i < v27; i++ {
 		this.Key[i] = byte(r.Intn(256))
 	}
-	v21 := hlc.NewPopulatedTimestamp(r, easy)
-	this.Timestamp = *v21
-	this.Priority = int32(r.Int31())
+	v28 := hlc.NewPopulatedTimestamp(r, easy)
+	this.Timestamp = *v28
+	this.Priority = github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnPriority(r.Int31())
 	if r.Intn(2) == 0 {
 		this.Priority *= -1
 	}
@@ -2515,9 +3387,9 @@ func randUTF8RuneData(r randyData) rune {
 	return rune(ru + 61)
 }
 func randStringData(r randyData) string {
-	v22 := r.Intn(100)
-	tmps := make([]rune, v22)
-	for i := 0; i < v22; i++ {
+	v29 := r.Intn(100)
+	tmps := make([]rune, v29)
+	for i := 0; i < v29; i++ {
 		tmps[i] = randUTF8RuneData(r)
 	}
 	return string(tmps)
@@ -2539,11 +3411,11 @@ func randFieldData(dAtA []byte, r randyData, fieldNumber int, wire int) []byte {
 	switch wire {
 	case 0:
 		dAtA = encodeVarintPopulateData(dAtA, uint64(key))
-		v23 := r.Int63()
+		v30 := r.Int63()
 		if r.Intn(2) == 0 {
-			v23 *= -1
+			v30 *= -1
 		}
-		dAtA = encodeVarintPopulateData(dAtA, uint64(v23))
+		dAtA = encodeVarintPopulateData(dAtA, uint64(v30))
 	case 1:
 		dAtA = encodeVarintPopulateData(dAtA, uint64(key))
 		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -2668,19 +3540,35 @@ func (m *ChangeReplicasTrigger) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.ChangeType != 0 {
-		n += 1 + sovData(uint64(m.ChangeType))
+	if m.DeprecatedChangeType != 0 {
+		n += 1 + sovData(uint64(m.DeprecatedChangeType))
 	}
-	l = m.Replica.Size()
+	l = m.DeprecatedReplica.Size()
 	n += 1 + l + sovData(uint64(l))
-	if len(m.UpdatedReplicas) > 0 {
-		for _, e := range m.UpdatedReplicas {
+	if len(m.DeprecatedUpdatedReplicas) > 0 {
+		for _, e := range m.DeprecatedUpdatedReplicas {
 			l = e.Size()
 			n += 1 + l + sovData(uint64(l))
 		}
 	}
-	if m.NextReplicaID != 0 {
-		n += 1 + sovData(uint64(m.NextReplicaID))
+	if m.DeprecatedNextReplicaID != 0 {
+		n += 1 + sovData(uint64(m.DeprecatedNextReplicaID))
+	}
+	if m.Desc != nil {
+		l = m.Desc.Size()
+		n += 1 + l + sovData(uint64(l))
+	}
+	if len(m.InternalAddedReplicas) > 0 {
+		for _, e := range m.InternalAddedReplicas {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
+	}
+	if len(m.InternalRemovedReplicas) > 0 {
+		for _, e := range m.InternalRemovedReplicas {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
 	}
 	return n
 }
@@ -2698,6 +3586,17 @@ func (m *ModifiedSpanTrigger) Size() (n int) {
 		l = m.NodeLivenessSpan.Size()
 		n += 1 + l + sovData(uint64(l))
 	}
+	return n
+}
+
+func (m *StickyBitTrigger) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.StickyBit.Size()
+	n += 1 + l + sovData(uint64(l))
 	return n
 }
 
@@ -2721,6 +3620,10 @@ func (m *InternalCommitTrigger) Size() (n int) {
 	}
 	if m.ModifiedSpanTrigger != nil {
 		l = m.ModifiedSpanTrigger.Size()
+		n += 1 + l + sovData(uint64(l))
+	}
+	if m.StickyBitTrigger != nil {
+		l = m.StickyBitTrigger.Size()
 		n += 1 + l + sovData(uint64(l))
 	}
 	return n
@@ -2757,8 +3660,6 @@ func (m *Transaction) Size() (n int) {
 	}
 	l = m.LastHeartbeat.Size()
 	n += 1 + l + sovData(uint64(l))
-	l = m.OrigTimestamp.Size()
-	n += 1 + l + sovData(uint64(l))
 	l = m.MaxTimestamp.Size()
 	n += 1 + l + sovData(uint64(l))
 	if len(m.ObservedTimestamps) > 0 {
@@ -2767,11 +3668,8 @@ func (m *Transaction) Size() (n int) {
 			n += 1 + l + sovData(uint64(l))
 		}
 	}
-	if m.Writing {
-		n += 2
-	}
-	if len(m.Intents) > 0 {
-		for _, e := range m.Intents {
+	if len(m.LockSpans) > 0 {
+		for _, e := range m.LockSpans {
 			l = e.Size()
 			n += 1 + l + sovData(uint64(l))
 		}
@@ -2779,12 +3677,22 @@ func (m *Transaction) Size() (n int) {
 	if m.WriteTooOld {
 		n += 2
 	}
-	l = m.EpochZeroTimestamp.Size()
+	l = m.ReadTimestamp.Size()
 	n += 1 + l + sovData(uint64(l))
-	l = m.RefreshedTimestamp.Size()
-	n += 1 + l + sovData(uint64(l))
-	if m.OrigTimestampWasObserved {
+	if m.CommitTimestampFixed {
 		n += 3
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, e := range m.InFlightWrites {
+			l = e.Size()
+			n += 2 + l + sovData(uint64(l))
+		}
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, e := range m.IgnoredSeqNums {
+			l = e.Size()
+			n += 2 + l + sovData(uint64(l))
+		}
 	}
 	return n
 }
@@ -2802,10 +3710,22 @@ func (m *TransactionRecord) Size() (n int) {
 	}
 	l = m.LastHeartbeat.Size()
 	n += 1 + l + sovData(uint64(l))
-	if len(m.Intents) > 0 {
-		for _, e := range m.Intents {
+	if len(m.LockSpans) > 0 {
+		for _, e := range m.LockSpans {
 			l = e.Size()
 			n += 1 + l + sovData(uint64(l))
+		}
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, e := range m.InFlightWrites {
+			l = e.Size()
+			n += 2 + l + sovData(uint64(l))
+		}
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, e := range m.IgnoredSeqNums {
+			l = e.Size()
+			n += 2 + l + sovData(uint64(l))
 		}
 	}
 	return n
@@ -2817,12 +3737,60 @@ func (m *Intent) Size() (n int) {
 	}
 	var l int
 	_ = l
+	l = m.Intent_SingleKeySpan.Size()
+	n += 1 + l + sovData(uint64(l))
+	l = m.Txn.Size()
+	n += 1 + l + sovData(uint64(l))
+	return n
+}
+
+func (m *Intent_SingleKeySpan) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovData(uint64(l))
+	}
+	return n
+}
+
+func (m *LockAcquisition) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovData(uint64(l))
+	l = m.Txn.Size()
+	n += 1 + l + sovData(uint64(l))
+	if m.Durability != 0 {
+		n += 1 + sovData(uint64(m.Durability))
+	}
+	return n
+}
+
+func (m *LockUpdate) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
 	l = m.Span.Size()
 	n += 1 + l + sovData(uint64(l))
 	l = m.Txn.Size()
 	n += 1 + l + sovData(uint64(l))
 	if m.Status != 0 {
 		n += 1 + sovData(uint64(m.Status))
+	}
+	if len(m.IgnoredSeqNums) > 0 {
+		for _, e := range m.IgnoredSeqNums {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
 	}
 	return n
 }
@@ -2892,7 +3860,7 @@ func (m *AbortSpanEntry) Size() (n int) {
 	return n
 }
 
-func (m *TxnCoordMeta) Size() (n int) {
+func (m *LeafTxnInputState) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -2900,39 +3868,57 @@ func (m *TxnCoordMeta) Size() (n int) {
 	_ = l
 	l = m.Txn.Size()
 	n += 1 + l + sovData(uint64(l))
-	if len(m.Intents) > 0 {
-		for _, e := range m.Intents {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
-	}
-	if m.CommandCount != 0 {
-		n += 1 + sovData(uint64(m.CommandCount))
-	}
-	if len(m.RefreshReads) > 0 {
-		for _, e := range m.RefreshReads {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
-	}
-	if len(m.RefreshWrites) > 0 {
-		for _, e := range m.RefreshWrites {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
-	}
-	if m.DeprecatedRefreshValid {
+	if m.RefreshInvalid {
 		n += 2
+	}
+	if len(m.InFlightWrites) > 0 {
+		for _, e := range m.InFlightWrites {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
+	}
+	if m.SteppingModeEnabled {
+		n += 2
+	}
+	if m.ReadSeqNum != 0 {
+		n += 1 + sovData(uint64(m.ReadSeqNum))
+	}
+	return n
+}
+
+func (m *LeafTxnFinalState) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.Txn.Size()
+	n += 1 + l + sovData(uint64(l))
+	if m.DeprecatedCommandCount != 0 {
+		n += 1 + sovData(uint64(m.DeprecatedCommandCount))
+	}
+	if len(m.RefreshSpans) > 0 {
+		for _, e := range m.RefreshSpans {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
 	}
 	if m.RefreshInvalid {
 		n += 2
 	}
-	if len(m.OutstandingWrites) > 0 {
-		for _, e := range m.OutstandingWrites {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
+	return n
+}
+
+func (m *RangeInfo) Size() (n int) {
+	if m == nil {
+		return 0
 	}
+	var l int
+	_ = l
+	l = m.Desc.Size()
+	n += 1 + l + sovData(uint64(l))
+	l = m.Lease.Size()
+	n += 1 + l + sovData(uint64(l))
 	return n
 }
 
@@ -3712,9 +4698,9 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ChangeType", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedChangeType", wireType)
 			}
-			m.ChangeType = 0
+			m.DeprecatedChangeType = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -3724,14 +4710,14 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.ChangeType |= (ReplicaChangeType(b) & 0x7F) << shift
+				m.DeprecatedChangeType |= (ReplicaChangeType(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Replica", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedReplica", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -3755,13 +4741,13 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.Replica.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.DeprecatedReplica.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedReplicas", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedUpdatedReplicas", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -3785,16 +4771,16 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.UpdatedReplicas = append(m.UpdatedReplicas, ReplicaDescriptor{})
-			if err := m.UpdatedReplicas[len(m.UpdatedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.DeprecatedUpdatedReplicas = append(m.DeprecatedUpdatedReplicas, ReplicaDescriptor{})
+			if err := m.DeprecatedUpdatedReplicas[len(m.DeprecatedUpdatedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 4:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NextReplicaID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedNextReplicaID", wireType)
 			}
-			m.NextReplicaID = 0
+			m.DeprecatedNextReplicaID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -3804,11 +4790,106 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.NextReplicaID |= (ReplicaID(b) & 0x7F) << shift
+				m.DeprecatedNextReplicaID |= (ReplicaID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Desc", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Desc == nil {
+				m.Desc = &RangeDescriptor{}
+			}
+			if err := m.Desc.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InternalAddedReplicas", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InternalAddedReplicas = append(m.InternalAddedReplicas, ReplicaDescriptor{})
+			if err := m.InternalAddedReplicas[len(m.InternalAddedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InternalRemovedReplicas", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InternalRemovedReplicas = append(m.InternalRemovedReplicas, ReplicaDescriptor{})
+			if err := m.InternalRemovedReplicas[len(m.InternalRemovedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(dAtA[iNdEx:])
@@ -3909,6 +4990,86 @@ func (m *ModifiedSpanTrigger) Unmarshal(dAtA []byte) error {
 				m.NodeLivenessSpan = &Span{}
 			}
 			if err := m.NodeLivenessSpan.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StickyBitTrigger) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StickyBitTrigger: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StickyBitTrigger: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StickyBit", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.StickyBit.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4091,6 +5252,39 @@ func (m *InternalCommitTrigger) Unmarshal(dAtA []byte) error {
 				m.ModifiedSpanTrigger = &ModifiedSpanTrigger{}
 			}
 			if err := m.ModifiedSpanTrigger.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StickyBitTrigger", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.StickyBitTrigger == nil {
+				m.StickyBitTrigger = &StickyBitTrigger{}
+			}
+			if err := m.StickyBitTrigger.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4351,36 +5545,6 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 6:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OrigTimestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.OrigTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		case 7:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field MaxTimestamp", wireType)
@@ -4442,29 +5606,9 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 9:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Writing", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.Writing = bool(v != 0)
 		case 11:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Intents", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field LockSpans", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4488,8 +5632,8 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Intents = append(m.Intents, Span{})
-			if err := m.Intents[len(m.Intents)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.LockSpans = append(m.LockSpans, Span{})
+			if err := m.LockSpans[len(m.LockSpans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4513,39 +5657,9 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.WriteTooOld = bool(v != 0)
-		case 14:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field EpochZeroTimestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.EpochZeroTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		case 15:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RefreshedTimestamp", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field ReadTimestamp", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4569,13 +5683,13 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.RefreshedTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.ReadTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 16:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OrigTimestampWasObserved", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field CommitTimestampFixed", wireType)
 			}
 			var v int
 			for shift := uint(0); ; shift += 7 {
@@ -4592,7 +5706,69 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-			m.OrigTimestampWasObserved = bool(v != 0)
+			m.CommitTimestampFixed = bool(v != 0)
+		case 17:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InFlightWrites", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InFlightWrites = append(m.InFlightWrites, SequencedWrite{})
+			if err := m.InFlightWrites[len(m.InFlightWrites)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 18:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IgnoredSeqNums", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.IgnoredSeqNums = append(m.IgnoredSeqNums, enginepb.IgnoredSeqNumRange{})
+			if err := m.IgnoredSeqNums[len(m.IgnoredSeqNums)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(dAtA[iNdEx:])
@@ -4724,7 +5900,7 @@ func (m *TransactionRecord) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 11:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Intents", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field LockSpans", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4748,8 +5924,70 @@ func (m *TransactionRecord) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Intents = append(m.Intents, Span{})
-			if err := m.Intents[len(m.Intents)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.LockSpans = append(m.LockSpans, Span{})
+			if err := m.LockSpans[len(m.LockSpans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 17:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InFlightWrites", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InFlightWrites = append(m.InFlightWrites, SequencedWrite{})
+			if err := m.InFlightWrites[len(m.InFlightWrites)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 18:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IgnoredSeqNums", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.IgnoredSeqNums = append(m.IgnoredSeqNums, enginepb.IgnoredSeqNumRange{})
+			if err := m.IgnoredSeqNums[len(m.IgnoredSeqNums)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4801,6 +6039,326 @@ func (m *Intent) Unmarshal(dAtA []byte) error {
 		}
 		if fieldNum <= 0 {
 			return fmt.Errorf("proto: Intent: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Intent_SingleKeySpan", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Intent_SingleKeySpan.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Txn", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Txn.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *Intent_SingleKeySpan) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SingleKeySpan: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SingleKeySpan: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *LockAcquisition) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LockAcquisition: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LockAcquisition: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Txn", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Txn.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Durability", wireType)
+			}
+			m.Durability = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Durability |= (lock.Durability(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *LockUpdate) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LockUpdate: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LockUpdate: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -4882,6 +6440,37 @@ func (m *Intent) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IgnoredSeqNums", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.IgnoredSeqNums = append(m.IgnoredSeqNums, enginepb.IgnoredSeqNumRange{})
+			if err := m.IgnoredSeqNums[len(m.IgnoredSeqNums)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(dAtA[iNdEx:])
@@ -4977,7 +6566,7 @@ func (m *SequencedWrite) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.Sequence |= (int32(b) & 0x7F) << shift
+				m.Sequence |= (github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnSeq(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -5354,7 +6943,7 @@ func (m *AbortSpanEntry) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.Priority |= (int32(b) & 0x7F) << shift
+				m.Priority |= (github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnPriority(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -5380,7 +6969,7 @@ func (m *AbortSpanEntry) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TxnCoordMeta) Unmarshal(dAtA []byte) error {
+func (m *LeafTxnInputState) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -5403,10 +6992,10 @@ func (m *TxnCoordMeta) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TxnCoordMeta: wiretype end group for non-group")
+			return fmt.Errorf("proto: LeafTxnInputState: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnCoordMeta: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: LeafTxnInputState: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -5439,138 +7028,6 @@ func (m *TxnCoordMeta) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Intents", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Intents = append(m.Intents, Span{})
-			if err := m.Intents[len(m.Intents)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field CommandCount", wireType)
-			}
-			m.CommandCount = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.CommandCount |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 4:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RefreshReads", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.RefreshReads = append(m.RefreshReads, Span{})
-			if err := m.RefreshReads[len(m.RefreshReads)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RefreshWrites", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.RefreshWrites = append(m.RefreshWrites, Span{})
-			if err := m.RefreshWrites[len(m.RefreshWrites)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 6:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedRefreshValid", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.DeprecatedRefreshValid = bool(v != 0)
 		case 7:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field RefreshInvalid", wireType)
@@ -5593,7 +7050,7 @@ func (m *TxnCoordMeta) Unmarshal(dAtA []byte) error {
 			m.RefreshInvalid = bool(v != 0)
 		case 8:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OutstandingWrites", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field InFlightWrites", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5617,8 +7074,307 @@ func (m *TxnCoordMeta) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.OutstandingWrites = append(m.OutstandingWrites, SequencedWrite{})
-			if err := m.OutstandingWrites[len(m.OutstandingWrites)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.InFlightWrites = append(m.InFlightWrites, SequencedWrite{})
+			if err := m.InFlightWrites[len(m.InFlightWrites)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SteppingModeEnabled", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.SteppingModeEnabled = bool(v != 0)
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ReadSeqNum", wireType)
+			}
+			m.ReadSeqNum = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ReadSeqNum |= (github_com_cockroachdb_cockroach_pkg_storage_enginepb.TxnSeq(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *LeafTxnFinalState) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LeafTxnFinalState: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LeafTxnFinalState: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Txn", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Txn.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedCommandCount", wireType)
+			}
+			m.DeprecatedCommandCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DeprecatedCommandCount |= (int32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RefreshSpans", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.RefreshSpans = append(m.RefreshSpans, Span{})
+			if err := m.RefreshSpans[len(m.RefreshSpans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RefreshInvalid", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.RefreshInvalid = bool(v != 0)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RangeInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RangeInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RangeInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Desc", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Desc.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Lease", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Lease.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5748,131 +7504,158 @@ var (
 	ErrIntOverflowData   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("roachpb/data.proto", fileDescriptor_data_54ebeb3253c73ae1) }
+func init() { proto.RegisterFile("roachpb/data.proto", fileDescriptor_data_d5d4f0921acc3a01) }
 
-var fileDescriptor_data_54ebeb3253c73ae1 = []byte{
-	// 1960 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcc, 0x58, 0xcb, 0x6f, 0xdb, 0xc8,
-	0x19, 0x37, 0x25, 0x4a, 0xa2, 0x3e, 0x3d, 0x4c, 0x8f, 0xe3, 0x44, 0xf5, 0xa2, 0x52, 0x56, 0x5b,
-	0xb4, 0x41, 0xb0, 0x2b, 0xa3, 0x49, 0x9f, 0x46, 0x5b, 0x40, 0xaf, 0x24, 0x54, 0x2c, 0x39, 0xa0,
-	0x68, 0x07, 0x9b, 0xc5, 0x82, 0xa5, 0xc9, 0xb1, 0x4c, 0x44, 0x22, 0xd5, 0xe1, 0xc8, 0xb1, 0xf7,
-	0x2f, 0xd8, 0x5b, 0xf7, 0xd0, 0x43, 0x8f, 0x01, 0x7a, 0xeb, 0x3f, 0xd0, 0xfe, 0x07, 0xcd, 0xa5,
-	0xc0, 0xde, 0x5a, 0xf4, 0x20, 0xb4, 0x2a, 0x0a, 0xb4, 0xe8, 0x6d, 0x8f, 0x01, 0x0a, 0x14, 0x33,
-	0x43, 0x4a, 0xf4, 0x5a, 0x31, 0xe4, 0xdd, 0x3d, 0xe4, 0x62, 0xcf, 0x7c, 0x8f, 0xdf, 0x7c, 0xf3,
-	0x3d, 0x87, 0x02, 0x44, 0x7c, 0xcb, 0x3e, 0x19, 0x1f, 0xed, 0x38, 0x16, 0xb5, 0x6a, 0x63, 0xe2,
-	0x53, 0x1f, 0x6d, 0xd8, 0xbe, 0xfd, 0x9c, 0xd3, 0x6b, 0x21, 0x77, 0xfb, 0x66, 0x24, 0x36, 0xc2,
-	0xd4, 0x5a, 0x88, 0x6e, 0x57, 0x03, 0xea, 0x13, 0x6b, 0x80, 0x77, 0xb0, 0x37, 0x70, 0xbd, 0xe8,
-	0x1f, 0x93, 0x3b, 0xb5, 0xed, 0x50, 0xe6, 0xbd, 0xab, 0x64, 0xee, 0x87, 0x42, 0xa5, 0x09, 0x75,
-	0x87, 0x3b, 0x27, 0x43, 0x7b, 0x87, 0xba, 0x23, 0x1c, 0x50, 0x6b, 0x34, 0x0e, 0x39, 0x37, 0x06,
-	0xfe, 0xc0, 0xe7, 0xcb, 0x1d, 0xb6, 0x12, 0xd4, 0xea, 0xc7, 0x20, 0xf7, 0xc7, 0x96, 0x87, 0xbe,
-	0x05, 0xc9, 0xe7, 0xf8, 0xbc, 0x94, 0xbc, 0x2d, 0xdd, 0xc9, 0x37, 0x32, 0xaf, 0xa7, 0x95, 0xe4,
-	0x63, 0x7c, 0xae, 0x33, 0x1a, 0xba, 0x0d, 0x19, 0xec, 0x39, 0x26, 0x63, 0xcb, 0x17, 0xd9, 0x69,
-	0xec, 0x39, 0x8f, 0xf1, 0xf9, 0x6e, 0xfe, 0xb7, 0x2f, 0x2b, 0x6b, 0x7f, 0x7c, 0x59, 0x91, 0xfe,
-	0xfd, 0xb2, 0x22, 0x75, 0x64, 0x45, 0x52, 0x13, 0x1d, 0x59, 0x49, 0xa8, 0xc9, 0xea, 0x08, 0x52,
-	0x87, 0xd6, 0x70, 0x82, 0xd1, 0x3b, 0x90, 0x25, 0xd6, 0x0b, 0xf3, 0xe8, 0x9c, 0xe2, 0xa0, 0x24,
-	0x31, 0x18, 0x5d, 0x21, 0xd6, 0x8b, 0x06, 0xdb, 0xa3, 0x3a, 0x64, 0xe7, 0xd6, 0x96, 0x12, 0xb7,
-	0xa5, 0x3b, 0xb9, 0x7b, 0xdf, 0xae, 0x2d, 0x9c, 0xc7, 0xae, 0x54, 0x3b, 0x19, 0xda, 0x35, 0x23,
-	0x12, 0x6a, 0xc8, 0xaf, 0xa6, 0x95, 0x35, 0x7d, 0xa1, 0xb5, 0x2b, 0xb3, 0xa3, 0xab, 0x1f, 0x81,
-	0xf2, 0x18, 0x9f, 0x8b, 0x13, 0xc3, 0x1b, 0x49, 0x4b, 0x6e, 0xf4, 0x03, 0x48, 0x9d, 0x32, 0x99,
-	0xf0, 0xac, 0x52, 0xed, 0x52, 0xa0, 0x6a, 0x1c, 0x23, 0x3c, 0x46, 0x08, 0x57, 0xff, 0x22, 0x01,
-	0xf4, 0xa9, 0x4f, 0xb0, 0xe6, 0x60, 0x8f, 0xa2, 0x01, 0x80, 0x3d, 0x9c, 0x04, 0x14, 0x13, 0xd3,
-	0x75, 0xc2, 0x63, 0x1e, 0x31, 0xf9, 0xbf, 0x4d, 0x2b, 0xf7, 0x07, 0x2e, 0x3d, 0x99, 0x1c, 0xd5,
-	0x6c, 0x7f, 0xb4, 0x33, 0xc7, 0x76, 0x8e, 0x16, 0xeb, 0x9d, 0xf1, 0xf3, 0xc1, 0x0e, 0x0f, 0xd5,
-	0x64, 0xe2, 0x3a, 0xb5, 0x83, 0x03, 0xad, 0x35, 0x9b, 0x56, 0xb2, 0x4d, 0x01, 0xa8, 0xb5, 0xf4,
-	0x6c, 0x88, 0xad, 0x39, 0xe8, 0x03, 0xc8, 0x78, 0xbe, 0x83, 0xd9, 0x29, 0xcc, 0xde, 0x54, 0xe3,
-	0xc6, 0x6c, 0x5a, 0x49, 0xf7, 0x7c, 0x07, 0x6b, 0xad, 0xd7, 0xf3, 0x95, 0x9e, 0x66, 0x42, 0x9a,
-	0x83, 0xbe, 0x0f, 0x0a, 0x4b, 0x14, 0x2e, 0x9f, 0xe4, 0xf2, 0x37, 0x67, 0xd3, 0x4a, 0x46, 0x58,
-	0xce, 0x14, 0xa2, 0xa5, 0x9e, 0x09, 0xc4, 0x6d, 0xaa, 0xbf, 0x97, 0x20, 0xdf, 0x1f, 0x0f, 0x5d,
-	0x6a, 0x10, 0x77, 0x30, 0xc0, 0x04, 0xb5, 0x21, 0x3b, 0xc4, 0xc7, 0xd4, 0x74, 0x70, 0x60, 0xf3,
-	0xab, 0xe5, 0xee, 0x55, 0x97, 0x38, 0x49, 0xb7, 0xbc, 0x01, 0x6e, 0xe1, 0xc0, 0x26, 0xee, 0x98,
-	0xfa, 0x24, 0x74, 0x97, 0xc2, 0x54, 0x19, 0x15, 0x3d, 0x04, 0x20, 0xee, 0xe0, 0x24, 0xc4, 0x49,
-	0x5c, 0x13, 0x27, 0xcb, 0x75, 0x19, 0x59, 0x44, 0xb7, 0x23, 0x2b, 0x49, 0x55, 0xae, 0xce, 0x12,
-	0x90, 0xef, 0x62, 0x32, 0xc0, 0x6f, 0xa9, 0xb1, 0xc8, 0x03, 0x55, 0x00, 0xb1, 0xba, 0x34, 0x03,
-	0x6a, 0xd1, 0x80, 0x17, 0x4e, 0xee, 0xde, 0xfb, 0x31, 0xb8, 0xb0, 0x98, 0x6b, 0xa2, 0x8a, 0x6b,
-	0x51, 0x31, 0xd7, 0xba, 0x87, 0xcd, 0x66, 0x9f, 0xe9, 0x34, 0x6e, 0x32, 0xe0, 0xd9, 0xb4, 0x52,
-	0xd4, 0x19, 0xda, 0x9c, 0xae, 0x17, 0x39, 0x7a, 0xf7, 0xd4, 0xb6, 0xf9, 0x1e, 0x3d, 0x80, 0xfc,
-	0x31, 0xc1, 0xf8, 0x13, 0xcc, 0xce, 0x22, 0xb4, 0x94, 0x5a, 0xbd, 0x80, 0x72, 0x42, 0xb1, 0xcf,
-	0xf4, 0x2e, 0x38, 0xf9, 0xcf, 0x09, 0xd8, 0x6a, 0x9e, 0xb0, 0x9b, 0xea, 0x78, 0x3c, 0x74, 0x6d,
-	0x2b, 0x58, 0x78, 0x3b, 0x67, 0x73, 0x86, 0x49, 0xcf, 0xc7, 0x98, 0xfb, 0xbb, 0x78, 0xef, 0x3b,
-	0xcb, 0xfc, 0x24, 0x14, 0x05, 0x8a, 0x71, 0x3e, 0xc6, 0x3a, 0xd8, 0xf3, 0x35, 0x6a, 0x41, 0x86,
-	0x08, 0x81, 0xd0, 0xd5, 0x57, 0x40, 0x5c, 0x72, 0x76, 0xa4, 0x8a, 0x0e, 0x40, 0x9d, 0x8c, 0x1d,
-	0x8b, 0x62, 0xc7, 0x0c, 0x49, 0x41, 0x29, 0x79, 0x3b, 0x79, 0x4d, 0xb8, 0xf5, 0x10, 0x23, 0xba,
-	0x2a, 0x7a, 0x00, 0xeb, 0x1e, 0x3e, 0xa3, 0x11, 0x26, 0xab, 0x24, 0x99, 0x57, 0x52, 0x79, 0x36,
-	0xad, 0x14, 0x7a, 0xf8, 0x8c, 0x86, 0xa2, 0xbc, 0x9e, 0xb2, 0xf3, 0x8d, 0x5e, 0xf0, 0x62, 0x3c,
-	0x67, 0x57, 0x61, 0x7d, 0x91, 0x37, 0xa6, 0xcf, 0x24, 0xd8, 0xec, 0xfa, 0x8e, 0x7b, 0xec, 0x62,
-	0x87, 0xf5, 0xdb, 0xc8, 0x9b, 0xef, 0x03, 0x0a, 0xce, 0x03, 0x8a, 0x47, 0xa6, 0xed, 0x7b, 0xc7,
-	0xee, 0xc0, 0x0c, 0xc6, 0x96, 0xc7, 0x9d, 0xaa, 0xe8, 0xaa, 0xe0, 0x34, 0x39, 0x83, 0x37, 0xe9,
-	0x36, 0x20, 0xde, 0x09, 0x86, 0xee, 0x29, 0xf6, 0x70, 0x10, 0x08, 0x69, 0xe1, 0xbf, 0x5b, 0x4b,
-	0x2e, 0xcc, 0x94, 0x74, 0x95, 0xa9, 0xec, 0x85, 0x1a, 0x8c, 0x12, 0xf6, 0xca, 0xff, 0x26, 0x60,
-	0x4b, 0xf3, 0x28, 0x26, 0x9e, 0x35, 0x6c, 0xfa, 0xa3, 0xd1, 0xa2, 0xfa, 0x5b, 0x50, 0x08, 0x58,
-	0x37, 0x30, 0xa9, 0x20, 0x84, 0x45, 0x55, 0x59, 0x7a, 0xc2, 0xa2, 0x6b, 0xe8, 0xf9, 0x20, 0xde,
-	0x43, 0x5a, 0x50, 0x18, 0xb1, 0x32, 0x9d, 0xa3, 0x24, 0xde, 0x88, 0x12, 0x2f, 0x67, 0x3d, 0x3f,
-	0x8a, 0x17, 0xf7, 0x2f, 0xe1, 0x56, 0x98, 0x6e, 0x51, 0x80, 0xe7, 0x78, 0x49, 0x8e, 0x77, 0x67,
-	0x09, 0xde, 0xd2, 0xcc, 0xd5, 0xb7, 0xec, 0xa5, 0x09, 0xfd, 0x0c, 0xb6, 0x46, 0x61, 0x64, 0xb8,
-	0x3f, 0xe7, 0xf8, 0xa2, 0x66, 0xbf, 0xbb, 0xcc, 0xde, 0xcb, 0x91, 0xd4, 0x37, 0x47, 0x97, 0x89,
-	0xbb, 0xca, 0xa7, 0xe1, 0x50, 0xac, 0xfe, 0x5a, 0x82, 0x8d, 0xfd, 0xa3, 0x00, 0x93, 0x53, 0xec,
-	0xcc, 0xab, 0x30, 0xde, 0xda, 0xa5, 0x15, 0x5a, 0xfb, 0x37, 0x30, 0x27, 0x95, 0x68, 0x4c, 0x57,
-	0xff, 0x95, 0x86, 0x9c, 0x41, 0x2c, 0x2f, 0xb0, 0x6c, 0xea, 0xfa, 0x1e, 0x7a, 0x04, 0x32, 0x7b,
-	0x94, 0x84, 0xc1, 0xbe, 0xbb, 0x42, 0xab, 0x32, 0xce, 0xbc, 0x2e, 0xa6, 0x56, 0x43, 0x61, 0x87,
-	0x7c, 0x3e, 0xad, 0x48, 0x3a, 0x47, 0x40, 0x08, 0x64, 0xcf, 0x1a, 0x89, 0xe9, 0x9a, 0xd5, 0xf9,
-	0x1a, 0xfd, 0x0c, 0xd2, 0xac, 0x13, 0x4e, 0x44, 0x2b, 0x5c, 0xde, 0x31, 0x62, 0xd6, 0xf4, 0xb9,
-	0xac, 0x1e, 0xea, 0xa0, 0x0e, 0x14, 0x87, 0x56, 0x40, 0xcd, 0x13, 0x6c, 0x11, 0x7a, 0x84, 0xad,
-	0x6b, 0x35, 0xb9, 0x02, 0x53, 0x7d, 0x14, 0x69, 0x32, 0x2c, 0x9f, 0xb8, 0x03, 0x73, 0xe1, 0xc9,
-	0xf4, 0x35, 0xb0, 0x98, 0xea, 0x22, 0x7e, 0x8f, 0xa0, 0x30, 0xb2, 0xce, 0x62, 0x50, 0x99, 0xd5,
-	0xa1, 0xf2, 0x23, 0xeb, 0x6c, 0x81, 0xf4, 0x11, 0x6c, 0xfa, 0x61, 0x7a, 0x2c, 0xe0, 0x82, 0x92,
-	0xf2, 0xc6, 0x66, 0x76, 0x29, 0x99, 0x42, 0x58, 0xe4, 0x7f, 0x99, 0x11, 0xa0, 0x12, 0x64, 0x5e,
-	0x10, 0x97, 0xba, 0xde, 0xa0, 0x94, 0xe5, 0xad, 0x25, 0xda, 0xa2, 0x1f, 0x43, 0xc6, 0xf5, 0x28,
-	0xf6, 0x68, 0x50, 0xca, 0xf1, 0xa3, 0xde, 0xd4, 0x46, 0xa2, 0xce, 0x1b, 0x4a, 0xa3, 0x2a, 0x14,
-	0x18, 0x06, 0x36, 0xa9, 0xef, 0x9b, 0xfe, 0xd0, 0x29, 0xe5, 0x39, 0x70, 0x8e, 0x13, 0x0d, 0xdf,
-	0xdf, 0x1f, 0x3a, 0xe8, 0x00, 0x6e, 0xe0, 0xb1, 0x6f, 0x9f, 0x98, 0x9f, 0x60, 0xe2, 0xc7, 0x9c,
-	0x54, 0x5c, 0xdd, 0x49, 0x88, 0x03, 0x3c, 0xc3, 0xc4, 0x5f, 0xb8, 0xca, 0x80, 0x4d, 0x82, 0x8f,
-	0x09, 0x0e, 0x4e, 0xe2, 0xbe, 0x2a, 0xad, 0x5f, 0x03, 0x75, 0xae, 0xbf, 0x40, 0xfd, 0x39, 0xbc,
-	0x73, 0x31, 0x2d, 0xcc, 0x17, 0x56, 0x60, 0x46, 0xce, 0x2c, 0xa9, 0xfc, 0x7a, 0xa5, 0x0b, 0xe1,
-	0x7f, 0x6a, 0x05, 0x51, 0x14, 0x2e, 0x3d, 0x81, 0x93, 0xaa, 0xdc, 0x91, 0x95, 0x82, 0x5a, 0xac,
-	0x7e, 0x91, 0x80, 0x8d, 0x58, 0x66, 0xeb, 0xd8, 0xf6, 0x89, 0xf3, 0x0d, 0x56, 0xdb, 0xdb, 0x53,
-	0x59, 0x5f, 0x35, 0x99, 0x16, 0x4d, 0x49, 0x7c, 0x35, 0xcc, 0xdd, 0x97, 0x56, 0x33, 0x1d, 0x59,
-	0xc9, 0xa8, 0x4a, 0x47, 0x56, 0x14, 0x35, 0xdb, 0x91, 0x95, 0xac, 0x0a, 0x1d, 0x59, 0x01, 0x35,
-	0xd7, 0x91, 0x95, 0xbc, 0x5a, 0x10, 0x2e, 0xee, 0xc8, 0x4a, 0x51, 0x5d, 0xef, 0xc8, 0xca, 0xba,
-	0xaa, 0x76, 0x64, 0x45, 0x55, 0x37, 0xaa, 0x7f, 0x92, 0x20, 0xad, 0x71, 0x74, 0xf4, 0x43, 0x90,
-	0xe7, 0x43, 0xf5, 0x0a, 0x93, 0x62, 0x6e, 0x65, 0xe2, 0xa8, 0x01, 0x49, 0x7a, 0x16, 0x0d, 0xd7,
-	0xeb, 0xc4, 0x47, 0xdc, 0x8d, 0x29, 0xc7, 0x42, 0x93, 0xbc, 0x7e, 0x68, 0xc2, 0x31, 0xfd, 0x10,
-	0x8a, 0x7d, 0xfc, 0xab, 0x09, 0xf6, 0x6c, 0xec, 0x3c, 0x65, 0xc5, 0x75, 0xd5, 0x87, 0xcd, 0x36,
-	0x28, 0x41, 0x28, 0x2c, 0xbe, 0x15, 0xf4, 0xf9, 0xbe, 0xfa, 0xbf, 0x24, 0xa4, 0xf6, 0xb0, 0x15,
-	0x60, 0xf4, 0x53, 0x48, 0x89, 0x97, 0xa2, 0xb4, 0x7a, 0xa8, 0x85, 0x06, 0xfa, 0x18, 0x00, 0x9f,
-	0x8d, 0x5d, 0x62, 0x31, 0x7b, 0x57, 0x1b, 0x41, 0xe5, 0x2f, 0xa6, 0x95, 0xed, 0xd8, 0x47, 0xd0,
-	0x6e, 0x95, 0x58, 0x9e, 0xe3, 0x4d, 0x86, 0x43, 0xeb, 0x68, 0x88, 0xab, 0x7a, 0x0c, 0x30, 0xfe,
-	0x2a, 0x4c, 0x7e, 0xf5, 0x57, 0xe1, 0x04, 0x6e, 0x39, 0x78, 0x4c, 0xb0, 0xcd, 0x1f, 0x86, 0xdc,
-	0x70, 0xf6, 0x37, 0x70, 0xa3, 0x77, 0xf8, 0xd7, 0xb4, 0x78, 0x6b, 0x81, 0xce, 0x5f, 0xce, 0x7d,
-	0x8e, 0x8d, 0x7a, 0x90, 0x1b, 0x13, 0x7f, 0xec, 0x07, 0xac, 0x2d, 0x05, 0xab, 0xd5, 0x51, 0x71,
-	0x36, 0xad, 0xc0, 0x93, 0x50, 0xcb, 0xe8, 0xeb, 0x10, 0x21, 0x18, 0x01, 0xba, 0x01, 0x29, 0xde,
-	0xfd, 0xf8, 0x7c, 0x4a, 0xea, 0x62, 0x83, 0x3e, 0x88, 0x85, 0x98, 0x4d, 0x9b, 0x64, 0x63, 0xe3,
-	0xf5, 0xb4, 0x52, 0xe0, 0x91, 0x8d, 0x12, 0x65, 0x11, 0x75, 0xf1, 0x04, 0x65, 0xe5, 0x55, 0xfd,
-	0x8d, 0x04, 0xc5, 0xfa, 0x91, 0x4f, 0x28, 0x4b, 0xf7, 0xb6, 0x47, 0xc9, 0xf9, 0x55, 0x99, 0xf4,
-	0xf5, 0x9f, 0x1a, 0x2c, 0x19, 0xc7, 0xc4, 0xf5, 0x89, 0x4b, 0xc5, 0xef, 0x0a, 0x29, 0x7d, 0xbe,
-	0x8f, 0x3d, 0x43, 0xfe, 0x93, 0x84, 0xbc, 0x71, 0xe6, 0x35, 0x7d, 0x9f, 0x38, 0xac, 0x7e, 0xd0,
-	0x8f, 0x44, 0xe1, 0x89, 0xdc, 0x2c, 0x5f, 0x5d, 0x31, 0xf1, 0x62, 0x8b, 0x75, 0x9f, 0xc4, 0xb5,
-	0x46, 0xd9, 0x7b, 0x50, 0xb0, 0xfd, 0xd1, 0xc8, 0xf2, 0x1c, 0xd3, 0xf6, 0x27, 0x1e, 0x0d, 0x8d,
-	0xcd, 0x87, 0xc4, 0x26, 0xa3, 0xa1, 0x06, 0x14, 0xc2, 0xa1, 0x61, 0x12, 0x6c, 0x39, 0x2c, 0x93,
-	0x56, 0x38, 0x23, 0x1f, 0xea, 0xe8, 0x4c, 0x05, 0xb5, 0xa0, 0x18, 0x61, 0xf0, 0x31, 0xc9, 0x72,
-	0x64, 0x05, 0x90, 0xe8, 0x60, 0x5e, 0xfd, 0x01, 0xfa, 0x09, 0x94, 0x62, 0xd9, 0x1d, 0x01, 0x9e,
-	0x5a, 0x43, 0xd7, 0xe1, 0x99, 0xa2, 0xe8, 0x37, 0x17, 0x7c, 0x5d, 0xb0, 0x0f, 0x19, 0x17, 0x7d,
-	0x0f, 0xd6, 0x23, 0x71, 0xd7, 0x13, 0x0a, 0x19, 0xae, 0x10, 0x99, 0xa5, 0x09, 0x2a, 0x3a, 0x04,
-	0xe4, 0x4f, 0x68, 0x40, 0x2d, 0xcf, 0x71, 0xbd, 0x41, 0x64, 0xac, 0x78, 0x8b, 0xbc, 0xbb, 0xcc,
-	0xd8, 0x0b, 0x0d, 0x2a, 0x34, 0x7b, 0x23, 0x06, 0x21, 0x4c, 0xbf, 0xfb, 0x07, 0x09, 0xb2, 0xfc,
-	0x87, 0x15, 0xfe, 0x09, 0x98, 0x83, 0xcc, 0x41, 0xef, 0x71, 0x6f, 0xff, 0x69, 0x4f, 0x5d, 0x43,
-	0x19, 0x48, 0x6a, 0x3d, 0x43, 0x95, 0x50, 0x16, 0x52, 0x0f, 0xf6, 0xf6, 0xeb, 0x86, 0x9a, 0x60,
-	0xcb, 0xc6, 0x87, 0x46, 0xbb, 0xaf, 0x26, 0xd1, 0x26, 0xac, 0xb7, 0xda, 0x7b, 0x5a, 0x57, 0x33,
-	0xda, 0x2d, 0x53, 0x10, 0x15, 0xa4, 0x80, 0x6c, 0x68, 0xdd, 0xb6, 0x2a, 0x33, 0xa8, 0x56, 0xbb,
-	0xa9, 0x75, 0xeb, 0x7b, 0x6a, 0x0a, 0x6d, 0xc1, 0xc6, 0x42, 0x36, 0x22, 0x67, 0x51, 0x1e, 0x94,
-	0xd6, 0x81, 0x5e, 0x37, 0xb4, 0xfd, 0x9e, 0x9a, 0x66, 0xd8, 0xc6, 0xc1, 0x93, 0xbd, 0xb6, 0x0a,
-	0x8c, 0xd1, 0xd0, 0x8c, 0xba, 0xae, 0xd7, 0x3f, 0x54, 0x73, 0xa8, 0x08, 0xc0, 0x40, 0xfb, 0x6d,
-	0x5d, 0x6b, 0xf7, 0x55, 0xa7, 0xca, 0xe6, 0x4f, 0xe6, 0xee, 0x2f, 0x60, 0xe3, 0xd2, 0xf7, 0x2c,
-	0x5a, 0x87, 0x5c, 0xbd, 0xd5, 0x32, 0xf5, 0xf6, 0x93, 0x3d, 0xad, 0x59, 0x57, 0xd7, 0x10, 0x82,
-	0xa2, 0xde, 0xee, 0xee, 0x1f, 0xb6, 0xe7, 0x34, 0x69, 0x5b, 0xfe, 0xf4, 0x77, 0xe5, 0xb5, 0xbb,
-	0x8d, 0x0b, 0x6f, 0x00, 0xd1, 0xe8, 0x99, 0xd5, 0x4f, 0xda, 0xbd, 0x96, 0xd6, 0x7b, 0xa8, 0xae,
-	0xa1, 0x02, 0x64, 0x9b, 0xfb, 0xdd, 0xae, 0x66, 0x18, 0xed, 0x96, 0x2a, 0x31, 0x5e, 0xbd, 0xb1,
-	0xaf, 0xb3, 0x4d, 0x42, 0x60, 0x34, 0xde, 0x7d, 0xf5, 0x8f, 0xf2, 0xda, 0xab, 0x59, 0x59, 0xfa,
-	0x7c, 0x56, 0x96, 0xfe, 0x3a, 0x2b, 0x4b, 0x7f, 0x9f, 0x95, 0xa5, 0xcf, 0xfe, 0x59, 0x5e, 0x7b,
-	0x96, 0x09, 0x03, 0x71, 0x94, 0xe6, 0x3f, 0xea, 0xdd, 0xff, 0x7f, 0x00, 0x00, 0x00, 0xff, 0xff,
-	0x01, 0x18, 0xd5, 0xf9, 0x8e, 0x14, 0x00, 0x00,
+var fileDescriptor_data_d5d4f0921acc3a01 = []byte{
+	// 2398 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xdc, 0x59, 0xcf, 0x73, 0x1b, 0x49,
+	0xf5, 0xf7, 0x58, 0x23, 0x69, 0xf4, 0xf4, 0xc3, 0xe3, 0x4e, 0x9c, 0x68, 0xbd, 0xdf, 0xaf, 0x15,
+	0xb4, 0xc0, 0x86, 0x14, 0x2b, 0x17, 0x4e, 0xd8, 0x82, 0x10, 0x28, 0x24, 0x4b, 0x49, 0xa4, 0x58,
+	0x76, 0x76, 0x24, 0x67, 0x49, 0x76, 0xa9, 0x61, 0x34, 0xd3, 0x96, 0x07, 0x6b, 0x66, 0xe4, 0xe9,
+	0x91, 0x63, 0xf1, 0x17, 0x2c, 0x5c, 0xd8, 0x2a, 0x2e, 0x1c, 0x53, 0xc5, 0x8d, 0x0b, 0x17, 0xa8,
+	0xe2, 0x02, 0xe7, 0x1c, 0x73, 0xdb, 0x2d, 0xb6, 0x4a, 0x80, 0x73, 0x01, 0xfe, 0x84, 0x54, 0x51,
+	0x45, 0x75, 0xf7, 0xfc, 0xb2, 0xad, 0x18, 0x79, 0x13, 0x8a, 0x2d, 0x2e, 0xf2, 0x74, 0xf7, 0x7b,
+	0x9f, 0xd7, 0xfd, 0xde, 0xeb, 0xf7, 0x5e, 0x3f, 0x03, 0x72, 0x1d, 0x4d, 0xdf, 0x1d, 0xf6, 0x56,
+	0x0d, 0xcd, 0xd3, 0x2a, 0x43, 0xd7, 0xf1, 0x1c, 0xb4, 0xa8, 0x3b, 0xfa, 0x1e, 0x9b, 0xaf, 0xf8,
+	0xab, 0xcb, 0xd7, 0xf6, 0x0e, 0x56, 0xf7, 0x0e, 0x08, 0x76, 0x0f, 0xb0, 0xbb, 0xaa, 0x3b, 0xb6,
+	0x3e, 0x72, 0x5d, 0x6c, 0xeb, 0xe3, 0xd5, 0x81, 0xa3, 0xef, 0xb1, 0x1f, 0xd3, 0xee, 0x73, 0xf6,
+	0xe5, 0x4b, 0x01, 0xa4, 0x85, 0x3d, 0x2d, 0x82, 0x5d, 0x7e, 0x93, 0x78, 0x8e, 0xab, 0xf5, 0xf1,
+	0x2a, 0xb6, 0xfb, 0xa6, 0x8d, 0x29, 0xc1, 0x81, 0xae, 0xfb, 0x8b, 0xff, 0x37, 0x75, 0xf1, 0xba,
+	0xbf, 0x5a, 0x1c, 0x79, 0xe6, 0x60, 0x75, 0x77, 0xa0, 0xaf, 0x7a, 0xa6, 0x85, 0x89, 0xa7, 0x59,
+	0x43, 0x7f, 0xe5, 0x62, 0xdf, 0xe9, 0x3b, 0xec, 0x73, 0x95, 0x7e, 0xf1, 0xd9, 0xf2, 0x0f, 0x41,
+	0xec, 0x0c, 0x35, 0x1b, 0xbd, 0x01, 0x89, 0x3d, 0x3c, 0x2e, 0x26, 0xae, 0x08, 0x57, 0x73, 0xb5,
+	0xf4, 0x8b, 0x49, 0x29, 0x71, 0x0f, 0x8f, 0x15, 0x3a, 0x87, 0xae, 0x40, 0x1a, 0xdb, 0x86, 0x4a,
+	0x97, 0xc5, 0xe3, 0xcb, 0x29, 0x6c, 0x1b, 0xf7, 0xf0, 0xf8, 0x66, 0xee, 0x97, 0x4f, 0x4a, 0x73,
+	0xbf, 0x7f, 0x52, 0x12, 0xfe, 0xf6, 0xa4, 0x24, 0xb4, 0x44, 0x49, 0x90, 0xe7, 0x5b, 0xa2, 0x34,
+	0x2f, 0x27, 0xca, 0x16, 0x24, 0x1f, 0x68, 0x83, 0x11, 0x46, 0x6f, 0x42, 0xc6, 0xd5, 0x1e, 0xab,
+	0xbd, 0xb1, 0x87, 0x49, 0x51, 0xa0, 0x30, 0x8a, 0xe4, 0x6a, 0x8f, 0x6b, 0x74, 0x8c, 0xaa, 0x90,
+	0x09, 0x77, 0x5b, 0x9c, 0xbf, 0x22, 0x5c, 0xcd, 0xae, 0xfd, 0x7f, 0x25, 0x52, 0x2d, 0x3d, 0x52,
+	0x65, 0x77, 0xa0, 0x57, 0xba, 0x01, 0x51, 0x4d, 0x7c, 0x3a, 0x29, 0xcd, 0x29, 0x11, 0xd7, 0x4d,
+	0x91, 0x8a, 0x2e, 0x7f, 0x00, 0xd2, 0x3d, 0x3c, 0xe6, 0x12, 0xfd, 0x13, 0x09, 0x53, 0x4e, 0x74,
+	0x03, 0x92, 0x07, 0x94, 0xc6, 0x97, 0x55, 0xac, 0x9c, 0x32, 0x63, 0x85, 0x61, 0xf8, 0x62, 0x38,
+	0x71, 0xf9, 0x13, 0x01, 0xa0, 0xe3, 0x39, 0x2e, 0x6e, 0x1a, 0xd8, 0xf6, 0x50, 0x1f, 0x40, 0x1f,
+	0x8c, 0x88, 0x87, 0x5d, 0xd5, 0x34, 0x7c, 0x31, 0x77, 0x29, 0xfd, 0x9f, 0x26, 0xa5, 0xeb, 0x7d,
+	0xd3, 0xdb, 0x1d, 0xf5, 0x2a, 0xba, 0x63, 0xad, 0x86, 0xd8, 0x46, 0x2f, 0xfa, 0x5e, 0x1d, 0xee,
+	0xf5, 0x57, 0x99, 0xa9, 0x46, 0x23, 0xd3, 0xa8, 0x6c, 0x6f, 0x37, 0xeb, 0x47, 0x93, 0x52, 0x66,
+	0x9d, 0x03, 0x36, 0xeb, 0x4a, 0xc6, 0xc7, 0x6e, 0x1a, 0xe8, 0x1d, 0x48, 0xdb, 0x8e, 0x81, 0xa9,
+	0x14, 0xba, 0xdf, 0x64, 0xed, 0xe2, 0xd1, 0xa4, 0x94, 0xda, 0x74, 0x0c, 0xdc, 0xac, 0xbf, 0x08,
+	0xbf, 0x94, 0x14, 0x25, 0x6a, 0x1a, 0xe8, 0x1b, 0x20, 0x51, 0x0f, 0x61, 0xf4, 0x09, 0x46, 0x7f,
+	0xe9, 0x68, 0x52, 0x4a, 0xf3, 0x9d, 0x53, 0x86, 0xe0, 0x53, 0x49, 0x13, 0x7e, 0x9a, 0xf2, 0xaf,
+	0x05, 0xc8, 0x75, 0x86, 0x03, 0xd3, 0xeb, 0xba, 0x66, 0xbf, 0x8f, 0x5d, 0xd4, 0x80, 0xcc, 0x00,
+	0xef, 0x78, 0xaa, 0x81, 0x89, 0xce, 0x8e, 0x96, 0x5d, 0x2b, 0x4f, 0x51, 0x92, 0xa2, 0xd9, 0x7d,
+	0x5c, 0xc7, 0x44, 0x77, 0xcd, 0xa1, 0xe7, 0xb8, 0xbe, 0xba, 0x24, 0xca, 0x4a, 0x67, 0xd1, 0x1d,
+	0x00, 0xd7, 0xec, 0xef, 0xfa, 0x38, 0xf3, 0xe7, 0xc4, 0xc9, 0x30, 0x5e, 0x3a, 0xcd, 0xad, 0xdb,
+	0x12, 0xa5, 0x84, 0x2c, 0x96, 0x3f, 0x9b, 0x87, 0x5c, 0x1b, 0xbb, 0x7d, 0xfc, 0x05, 0xdd, 0x2c,
+	0xea, 0x83, 0xcc, 0x81, 0xe8, 0xbd, 0x54, 0x89, 0xa7, 0x79, 0x84, 0x5d, 0x9c, 0xec, 0xda, 0x57,
+	0x62, 0x70, 0xfe, 0x2d, 0xae, 0x04, 0xb7, 0xb8, 0xd2, 0x7e, 0xb0, 0xbe, 0xde, 0xa1, 0xc4, 0xb5,
+	0x4b, 0x14, 0xf1, 0x68, 0x52, 0x2a, 0x28, 0x14, 0x26, 0x9c, 0x57, 0x0a, 0x0c, 0xb6, 0x7d, 0xa0,
+	0xeb, 0x6c, 0x8c, 0x6e, 0x43, 0x6e, 0xc7, 0xc5, 0xf8, 0x27, 0x98, 0x0a, 0x71, 0xbd, 0x62, 0x72,
+	0xf6, 0x9b, 0x93, 0xe5, 0x8c, 0x1d, 0xca, 0x77, 0x4c, 0xbb, 0xbf, 0x49, 0xc2, 0xd2, 0xfa, 0x2e,
+	0x3d, 0xa2, 0x82, 0x87, 0x03, 0x53, 0xd7, 0x48, 0xa0, 0xe6, 0x47, 0x70, 0xc9, 0xc0, 0x43, 0x17,
+	0xeb, 0x9a, 0x87, 0x0d, 0x55, 0x67, 0x34, 0xaa, 0x37, 0x1e, 0x62, 0xa6, 0xf3, 0xc2, 0xda, 0x97,
+	0xa7, 0xe9, 0x8a, 0x63, 0x70, 0xc0, 0xee, 0x78, 0x88, 0x95, 0x8b, 0x11, 0x46, 0x34, 0x8b, 0x1e,
+	0x02, 0x8a, 0x61, 0xbb, 0x9c, 0xcb, 0xb7, 0xc1, 0x19, 0xb8, 0xa7, 0xac, 0xb0, 0x18, 0xa1, 0xf8,
+	0x24, 0xe8, 0xc7, 0xf0, 0x66, 0x0c, 0x7a, 0x34, 0x34, 0xe2, 0x22, 0x48, 0x31, 0x71, 0x25, 0x71,
+	0x4e, 0x19, 0x6f, 0x44, 0x70, 0xdb, 0x1c, 0x2d, 0xd0, 0x14, 0xc2, 0xb0, 0x1c, 0x93, 0x65, 0xe3,
+	0x43, 0x2f, 0x10, 0x44, 0x2f, 0xa3, 0xc8, 0x2e, 0xe3, 0xd5, 0xa3, 0x49, 0xe9, 0x72, 0x3d, 0xa4,
+	0xda, 0xc4, 0x87, 0x9e, 0xcf, 0xcf, 0x2e, 0x67, 0x26, 0x1c, 0x28, 0x97, 0x8d, 0xa9, 0x54, 0x06,
+	0x7a, 0x17, 0x44, 0xe6, 0xa3, 0xc9, 0x59, 0x7d, 0x54, 0x61, 0xf4, 0xa8, 0x07, 0x97, 0x4d, 0xdb,
+	0xc3, 0xae, 0xad, 0x0d, 0x54, 0xcd, 0x30, 0xe2, 0x6a, 0x48, 0x9d, 0x5b, 0x0d, 0x4b, 0x01, 0x54,
+	0x95, 0x22, 0x85, 0x2a, 0xd8, 0x81, 0x37, 0x42, 0x19, 0x2e, 0xb6, 0x9c, 0x83, 0xb8, 0x94, 0xf4,
+	0xb9, 0xa5, 0x84, 0x1b, 0x56, 0x38, 0x56, 0x20, 0xe7, 0xa6, 0x44, 0x53, 0x0e, 0x8b, 0xf9, 0x1f,
+	0x0b, 0x70, 0xa1, 0xed, 0x18, 0xe6, 0x8e, 0x89, 0x0d, 0x9a, 0xca, 0x02, 0x7f, 0xfd, 0x3a, 0x20,
+	0x32, 0x26, 0x1e, 0xb6, 0x54, 0xdd, 0xb1, 0x77, 0xcc, 0xbe, 0x4a, 0x86, 0x9a, 0xcd, 0x7c, 0x55,
+	0x52, 0x64, 0xbe, 0xb2, 0xce, 0x16, 0x58, 0xfe, 0x6b, 0x00, 0x62, 0x41, 0x76, 0x60, 0x1e, 0x60,
+	0x1b, 0x13, 0xc2, 0xa9, 0xb9, 0x07, 0x5e, 0x9e, 0xb2, 0x61, 0xca, 0xa4, 0xc8, 0x94, 0x65, 0xc3,
+	0xe7, 0xa0, 0x33, 0x7e, 0x1a, 0xfa, 0x10, 0xe4, 0x8e, 0x67, 0xea, 0x7b, 0xe3, 0x5a, 0x14, 0x52,
+	0x6b, 0x00, 0x84, 0xcd, 0xa9, 0x3d, 0xd3, 0xf3, 0xc3, 0xd4, 0x6c, 0x49, 0x8e, 0x04, 0x50, 0x3e,
+	0xfa, 0x1f, 0x13, 0xb0, 0xd4, 0xf4, 0xd5, 0xb2, 0xee, 0x58, 0x56, 0x24, 0xa3, 0x0e, 0x79, 0x42,
+	0xc3, 0xb8, 0xea, 0xf1, 0x09, 0x5f, 0x4c, 0x69, 0xea, 0xfe, 0xa3, 0x70, 0xaf, 0xe4, 0x48, 0x3c,
+	0xf8, 0xd7, 0x21, 0x6f, 0xd1, 0xf8, 0x1a, 0xa2, 0xcc, 0xbf, 0x14, 0x25, 0x1e, 0x87, 0x95, 0x9c,
+	0x15, 0x8f, 0xca, 0x3f, 0x82, 0xcb, 0x7e, 0x8c, 0x08, 0xcc, 0x1f, 0xe2, 0x25, 0x18, 0xde, 0xd5,
+	0x29, 0x78, 0x53, 0x23, 0x8f, 0xb2, 0xa4, 0xbf, 0x24, 0x20, 0x2d, 0x59, 0xbe, 0xdd, 0x99, 0xb5,
+	0x42, 0x7c, 0x1e, 0x6c, 0xbf, 0x3a, 0x6d, 0xbf, 0xa7, 0xfd, 0x44, 0xb9, 0x60, 0x4d, 0x71, 0x9e,
+	0xf7, 0x00, 0x45, 0xd6, 0x0a, 0x81, 0xf9, 0x85, 0x7b, 0x6b, 0x9a, 0x3a, 0x4f, 0x98, 0x5b, 0x91,
+	0xc9, 0x89, 0x99, 0x9b, 0xd2, 0x47, 0x7e, 0x81, 0x54, 0xfe, 0xb9, 0x00, 0x8b, 0x5b, 0x3d, 0x56,
+	0x22, 0x1a, 0xa1, 0xb5, 0xe3, 0x69, 0x5e, 0x98, 0x21, 0xcd, 0xbf, 0x86, 0x9a, 0x49, 0x0a, 0x4a,
+	0xb6, 0xf2, 0xdf, 0x53, 0x90, 0xed, 0xba, 0x9a, 0x4d, 0x34, 0xdd, 0x33, 0x1d, 0x1b, 0x55, 0x41,
+	0xa4, 0x25, 0xa9, 0xef, 0x3f, 0x6f, 0x9d, 0x95, 0xb6, 0xba, 0x87, 0x76, 0x1b, 0x7b, 0x5a, 0x4d,
+	0xa2, 0xe8, 0xcf, 0x26, 0x25, 0x41, 0x61, 0xac, 0x08, 0x81, 0x68, 0x6b, 0x16, 0x2f, 0xb1, 0x32,
+	0x0a, 0xfb, 0x46, 0xb7, 0x20, 0x45, 0xd3, 0xe1, 0x88, 0xe7, 0xc3, 0xe9, 0x29, 0x23, 0xb6, 0x8d,
+	0x0e, 0xa3, 0x55, 0x7c, 0x1e, 0xd4, 0x82, 0xc2, 0x40, 0x23, 0x9e, 0xba, 0x8b, 0x35, 0xd7, 0xeb,
+	0x61, 0xed, 0x5c, 0x09, 0x2f, 0x4f, 0x59, 0xef, 0x06, 0x9c, 0xe8, 0x2e, 0xe4, 0x2d, 0xed, 0x50,
+	0x8d, 0x34, 0x98, 0x9e, 0x1d, 0x2a, 0x67, 0x69, 0x87, 0x91, 0xd9, 0x3e, 0x80, 0x0b, 0x8e, 0x6f,
+	0xcb, 0x08, 0x8e, 0x14, 0xa5, 0x97, 0x86, 0xba, 0x53, 0x96, 0xf7, 0x61, 0x91, 0x73, 0x72, 0x81,
+	0xa0, 0x5b, 0x00, 0xf4, 0xc5, 0xc0, 0xdc, 0x9b, 0x14, 0xb3, 0x0c, 0xf3, 0x65, 0xd1, 0x28, 0xb0,
+	0x2f, 0x65, 0xa0, 0x63, 0x82, 0xca, 0x90, 0x7f, 0xec, 0x9a, 0x1e, 0x56, 0x3d, 0xc7, 0x51, 0x9d,
+	0x81, 0x51, 0xcc, 0xb1, 0xe0, 0x97, 0x65, 0x93, 0x5d, 0xc7, 0xd9, 0x1a, 0x18, 0x54, 0xa9, 0x2e,
+	0xd6, 0x62, 0x5b, 0x2f, 0x2e, 0x9c, 0x43, 0xa9, 0x94, 0x35, 0x52, 0xc5, 0x0d, 0xb8, 0xa4, 0xb3,
+	0x78, 0x14, 0xa1, 0xa9, 0x3b, 0xe6, 0x21, 0x36, 0x8a, 0x32, 0x13, 0x7c, 0x91, 0xaf, 0x86, 0x0c,
+	0xb7, 0xe9, 0x1a, 0x7a, 0x0f, 0x64, 0xd3, 0x56, 0x77, 0x06, 0xac, 0x64, 0x62, 0x5b, 0x23, 0xc5,
+	0x45, 0x76, 0xd2, 0x2f, 0x4d, 0x3b, 0x29, 0xde, 0x1f, 0x61, 0x5b, 0xc7, 0xc6, 0xfb, 0x94, 0xd2,
+	0xdf, 0x47, 0xc1, 0xb4, 0x6f, 0x33, 0x7e, 0x36, 0x49, 0x90, 0x03, 0x0b, 0x66, 0xdf, 0x76, 0x5c,
+	0x1a, 0x18, 0xf0, 0xbe, 0x3d, 0xb2, 0x48, 0x11, 0x31, 0xc4, 0xca, 0x59, 0x9e, 0xdc, 0xe4, 0x2c,
+	0x1d, 0xbc, 0xbf, 0x39, 0xb2, 0x58, 0x06, 0x8d, 0x2a, 0xb1, 0x63, 0x6b, 0x44, 0x29, 0x98, 0xe1,
+	0x98, 0xa2, 0x9f, 0x7a, 0x00, 0x25, 0x64, 0xb1, 0x25, 0x4a, 0x29, 0x39, 0xdd, 0x12, 0xa5, 0x8c,
+	0x0c, 0x2d, 0x51, 0xca, 0xcb, 0x85, 0x96, 0x28, 0x15, 0xe4, 0x85, 0xf2, 0x6f, 0x45, 0x58, 0x8c,
+	0x39, 0xb9, 0x82, 0x75, 0xc7, 0x35, 0x5e, 0xc7, 0x8d, 0xfb, 0xe2, 0xdc, 0xae, 0x57, 0x73, 0xdb,
+	0xff, 0x05, 0x87, 0x90, 0x62, 0xce, 0x30, 0x2f, 0x27, 0x4e, 0xb8, 0x44, 0x5a, 0x96, 0x5a, 0xa2,
+	0x24, 0xc9, 0x99, 0xd0, 0x3d, 0x40, 0xce, 0xb6, 0x44, 0x29, 0x27, 0xe7, 0xe3, 0xae, 0xd2, 0x12,
+	0xa5, 0x05, 0x59, 0x6e, 0x89, 0x92, 0x2c, 0x2f, 0x96, 0xff, 0x21, 0x40, 0x8a, 0x66, 0x7d, 0xdb,
+	0x43, 0x0f, 0x61, 0x81, 0x98, 0x76, 0x7f, 0x80, 0xe9, 0x9b, 0x3c, 0x2a, 0x6b, 0xb2, 0x6b, 0x6f,
+	0x4f, 0xd1, 0x0f, 0xe7, 0xa9, 0x74, 0x18, 0xc3, 0x3d, 0x3c, 0x66, 0x3a, 0x8f, 0x5c, 0x27, 0x4f,
+	0xe2, 0x0b, 0xe8, 0x3b, 0x90, 0xf0, 0x0e, 0x83, 0xba, 0x67, 0x26, 0x2f, 0xe4, 0x0a, 0xa7, 0x5c,
+	0xcb, 0x35, 0xc8, 0x1f, 0x13, 0x73, 0x46, 0x53, 0x21, 0x7c, 0x73, 0x84, 0xad, 0x82, 0x96, 0x28,
+	0x89, 0x72, 0xd2, 0x2f, 0x71, 0xfe, 0x2c, 0xc0, 0xc2, 0x86, 0xa3, 0xef, 0x55, 0xf5, 0xfd, 0x91,
+	0x49, 0x4c, 0x96, 0x93, 0xbe, 0x09, 0x62, 0xec, 0xa8, 0x2f, 0x75, 0xa7, 0xd8, 0xad, 0x20, 0xaf,
+	0x7a, 0x22, 0xa4, 0x00, 0x18, 0x23, 0x57, 0xeb, 0x99, 0x03, 0xd3, 0xe3, 0xe7, 0x28, 0xac, 0xad,
+	0xc5, 0x30, 0xf6, 0x0e, 0x2a, 0x41, 0xaf, 0xa7, 0x12, 0xeb, 0xf5, 0x54, 0xa8, 0x33, 0x57, 0xea,
+	0x21, 0xa7, 0x12, 0x43, 0xf1, 0x4f, 0xf8, 0xbb, 0x79, 0x00, 0x7a, 0x42, 0xfe, 0x84, 0xf8, 0xaf,
+	0x1c, 0x2e, 0x8a, 0x17, 0x89, 0xcf, 0x11, 0x2f, 0xa6, 0x5c, 0x29, 0xf1, 0x3f, 0x7a, 0xa5, 0xb8,
+	0xde, 0x7e, 0x21, 0x40, 0xe1, 0xf8, 0x95, 0x3f, 0xab, 0xd1, 0xf3, 0x21, 0x48, 0xc4, 0x27, 0xf6,
+	0x7b, 0x27, 0xdf, 0x7f, 0x31, 0x29, 0xdd, 0x9a, 0xa9, 0x3b, 0x73, 0xb2, 0xcd, 0x46, 0x55, 0xd8,
+	0xc1, 0xfb, 0x4a, 0x88, 0x18, 0xab, 0x9f, 0xfe, 0x90, 0x80, 0xe4, 0x06, 0xd6, 0x08, 0x46, 0xdf,
+	0x86, 0x24, 0x7f, 0x8c, 0x9f, 0xa3, 0xc2, 0xe7, 0x1c, 0xe8, 0xbb, 0x00, 0xf8, 0x70, 0x68, 0xba,
+	0x1a, 0xd5, 0xf6, 0x4c, 0x25, 0x9d, 0x12, 0x63, 0x40, 0x75, 0x48, 0x07, 0x0f, 0xe7, 0xc4, 0xb9,
+	0x1f, 0xce, 0x01, 0x2b, 0xda, 0x86, 0xd8, 0xb3, 0x93, 0xf7, 0x15, 0xe8, 0x2f, 0x31, 0x83, 0x1e,
+	0xc6, 0xbf, 0xd9, 0xd1, 0x52, 0xc4, 0xcd, 0x9a, 0x0b, 0x1d, 0xc6, 0x8b, 0x36, 0x21, 0x3b, 0x74,
+	0x9d, 0xa1, 0x43, 0x68, 0x95, 0x44, 0x66, 0x4b, 0x2d, 0x85, 0xa3, 0x49, 0x09, 0xee, 0xfb, 0x5c,
+	0xdd, 0x8e, 0x02, 0x01, 0x42, 0x97, 0xa0, 0x8b, 0x90, 0xc4, 0x43, 0x47, 0xdf, 0x2d, 0xa6, 0xae,
+	0x08, 0x57, 0x13, 0x0a, 0x1f, 0xa0, 0x77, 0x62, 0xe6, 0xa6, 0x05, 0x5d, 0xa2, 0xb6, 0xf8, 0x62,
+	0x52, 0xca, 0x33, 0xcb, 0x04, 0x4e, 0x13, 0xb7, 0x5f, 0x90, 0xb5, 0xcb, 0x9f, 0x09, 0x50, 0xa8,
+	0xf6, 0x1c, 0xd7, 0xa3, 0xb7, 0xac, 0x61, 0x7b, 0xee, 0xf8, 0x2c, 0xaf, 0x7a, 0xf5, 0xd2, 0x1b,
+	0x69, 0x20, 0x0d, 0x5d, 0xd3, 0x71, 0x83, 0xb0, 0x92, 0xac, 0x35, 0x5e, 0x4c, 0x4a, 0xd5, 0xcf,
+	0xed, 0x98, 0xf7, 0x7d, 0x30, 0x25, 0x84, 0x8d, 0x79, 0xe7, 0x3f, 0xe7, 0x61, 0x71, 0x03, 0x6b,
+	0x3b, 0xdd, 0x43, 0xbb, 0x69, 0x0f, 0x47, 0xd4, 0x26, 0x1e, 0x46, 0xef, 0xf2, 0xd8, 0xc1, 0xfd,
+	0x74, 0xe5, 0xec, 0xbb, 0x1f, 0x0f, 0x1b, 0x6f, 0xc3, 0x82, 0x8b, 0x77, 0x5c, 0x4c, 0x76, 0x55,
+	0xd3, 0x3e, 0xd0, 0x06, 0xa6, 0xc1, 0x74, 0x2d, 0x29, 0x05, 0x7f, 0xba, 0xc9, 0x67, 0xa7, 0xe6,
+	0x71, 0xe9, 0xd5, 0xf2, 0xf8, 0x1a, 0x2c, 0x11, 0x0f, 0x0f, 0x87, 0xa6, 0xdd, 0x57, 0x2d, 0xfa,
+	0x58, 0xc2, 0xb6, 0xd6, 0x1b, 0x60, 0xa3, 0x98, 0x61, 0x3b, 0xb8, 0x10, 0x2c, 0xb6, 0x1d, 0x03,
+	0x37, 0xf8, 0x12, 0xea, 0x41, 0x8e, 0x55, 0xb8, 0x04, 0xef, 0xab, 0xf6, 0xc8, 0x2a, 0xc2, 0x6b,
+	0x8a, 0x03, 0x40, 0x51, 0x79, 0xb0, 0x3a, 0x91, 0xe4, 0x45, 0x39, 0xd9, 0x12, 0xa5, 0xa4, 0x9c,
+	0xe2, 0x09, 0xbf, 0xfc, 0xb3, 0x48, 0xff, 0xb7, 0x4d, 0x5b, 0x1b, 0xbc, 0x9a, 0xfe, 0xbf, 0x05,
+	0xc5, 0x78, 0x1f, 0xce, 0xb1, 0x2c, 0xcd, 0xa6, 0x7f, 0x47, 0xb6, 0xc7, 0x5d, 0x49, 0x89, 0xf5,
+	0xe9, 0xd6, 0xf9, 0xf2, 0x3a, 0x5d, 0x45, 0x35, 0xc8, 0x07, 0x96, 0xe3, 0x95, 0x99, 0x38, 0x4b,
+	0x65, 0x96, 0xf3, 0x79, 0x78, 0x71, 0x36, 0xab, 0xf5, 0x43, 0x95, 0x84, 0x6a, 0xe0, 0x15, 0x4f,
+	0xf9, 0xa7, 0x02, 0x64, 0x58, 0xe0, 0x6f, 0xda, 0x3b, 0x0e, 0xba, 0xe5, 0xb7, 0xb2, 0xce, 0xdb,
+	0xb6, 0xe5, 0x0d, 0xad, 0x1b, 0x90, 0x1c, 0xd0, 0xbb, 0x7d, 0x46, 0x1f, 0x9f, 0xdd, 0xfd, 0x20,
+	0xce, 0x32, 0xe2, 0xa8, 0x75, 0x74, 0xed, 0x13, 0x01, 0x32, 0xac, 0xd1, 0xcf, 0x9a, 0x90, 0x59,
+	0x48, 0x6f, 0x6f, 0xde, 0xdb, 0xdc, 0x7a, 0x7f, 0x53, 0x9e, 0x43, 0x69, 0x48, 0x34, 0x37, 0xbb,
+	0xb2, 0x80, 0x32, 0x90, 0xbc, 0xbd, 0xb1, 0x55, 0xed, 0xca, 0xf3, 0xf4, 0xb3, 0xf6, 0xb0, 0xdb,
+	0xe8, 0xc8, 0x09, 0x74, 0x01, 0x16, 0xea, 0x8d, 0x8d, 0x66, 0xbb, 0xd9, 0x6d, 0xd4, 0x55, 0x3e,
+	0x29, 0x21, 0x09, 0xc4, 0x6e, 0xb3, 0xdd, 0x90, 0x45, 0x0a, 0x55, 0x6f, 0xac, 0x37, 0xdb, 0xd5,
+	0x0d, 0x39, 0x89, 0x96, 0x60, 0x31, 0xa2, 0x0d, 0xa6, 0x33, 0x28, 0x07, 0x52, 0x7d, 0x5b, 0xa9,
+	0x76, 0x9b, 0x5b, 0x9b, 0x72, 0x0a, 0x01, 0xa4, 0x28, 0x6f, 0xf7, 0x91, 0x9c, 0xa3, 0xb2, 0xef,
+	0x34, 0xb6, 0xe4, 0x3c, 0x13, 0xb8, 0xf5, 0x83, 0xb5, 0xba, 0x5c, 0xa0, 0x9f, 0xdd, 0xed, 0xfb,
+	0x1b, 0x0d, 0x19, 0x28, 0x63, 0xad, 0xd9, 0xad, 0x2a, 0x4a, 0xf5, 0xa1, 0x9c, 0x45, 0x05, 0x00,
+	0xca, 0xd8, 0x69, 0x28, 0xcd, 0x46, 0x47, 0x36, 0xca, 0xb4, 0xba, 0x4c, 0x5f, 0xfb, 0x1e, 0x2c,
+	0x9e, 0xea, 0xbd, 0xa2, 0x05, 0xc8, 0x56, 0xeb, 0x75, 0x55, 0x69, 0xdc, 0xdf, 0x68, 0xae, 0x57,
+	0xe5, 0x39, 0x84, 0xa0, 0xa0, 0x34, 0xda, 0x5b, 0x0f, 0x1a, 0xe1, 0x9c, 0xb0, 0x2c, 0x7e, 0xf4,
+	0xab, 0x95, 0xb9, 0x6b, 0x5b, 0xc7, 0xde, 0x28, 0x3c, 0xf5, 0xd3, 0x53, 0xdd, 0x6f, 0x6c, 0xd6,
+	0x9b, 0x9b, 0x77, 0xe4, 0x39, 0x3a, 0xe8, 0x74, 0xab, 0x77, 0xe8, 0x20, 0x81, 0xf2, 0x90, 0x59,
+	0xdf, 0x6a, 0xb7, 0x9b, 0xdd, 0x6e, 0xa3, 0x2e, 0x0b, 0x74, 0xad, 0x5a, 0xdb, 0x52, 0xe8, 0x60,
+	0x9e, 0x03, 0xd6, 0xbe, 0xf6, 0xf4, 0xaf, 0x2b, 0x73, 0x4f, 0x8f, 0x56, 0x84, 0x67, 0x47, 0x2b,
+	0xc2, 0xa7, 0x47, 0x2b, 0xc2, 0x5f, 0x8e, 0x56, 0x84, 0x8f, 0x9f, 0xaf, 0xcc, 0x3d, 0x7b, 0xbe,
+	0x32, 0xf7, 0xe9, 0xf3, 0x95, 0xb9, 0x47, 0x69, 0xdf, 0x64, 0xbd, 0x14, 0xfb, 0xcf, 0xd4, 0xf5,
+	0x7f, 0x05, 0x00, 0x00, 0xff, 0xff, 0x4c, 0x7b, 0x6a, 0x40, 0x71, 0x1b, 0x00, 0x00,
 }

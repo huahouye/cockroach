@@ -1,26 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "options.h"
+#include <limits>
+#include <rocksdb/env.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/table.h>
 #include "cache.h"
 #include "comparator.h"
+#include "db.h"
 #include "encoding.h"
 #include "godefs.h"
 #include "merge.h"
+#include "protos/util/log/log.pb.h"
 #include "table_props.h"
 
 namespace cockroach {
@@ -46,9 +46,37 @@ class DBPrefixExtractor : public rocksdb::SliceTransform {
 // The DBLogger is a rocksdb::Logger that calls back into Go code for formatted logging.
 class DBLogger : public rocksdb::Logger {
  public:
-  DBLogger(int go_log_level) : go_log_level_(go_log_level) {}
+  DBLogger(bool use_primary_log) : use_primary_log_(use_primary_log) {}
 
-  virtual void Logv(const char* format, va_list ap) {
+  virtual void Logv(const rocksdb::InfoLogLevel log_level, const char* format,
+                    va_list ap) override {
+    int go_log_level = util::log::Severity::UNKNOWN;  // compiler tells us to initialize it
+    switch (log_level) {
+    case rocksdb::DEBUG_LEVEL:
+      // There is no DEBUG severity. Just give it INFO severity, then.
+      go_log_level = util::log::Severity::INFO;
+      break;
+    case rocksdb::INFO_LEVEL:
+      go_log_level = util::log::Severity::INFO;
+      break;
+    case rocksdb::WARN_LEVEL:
+      go_log_level = util::log::Severity::WARNING;
+      break;
+    case rocksdb::ERROR_LEVEL:
+      go_log_level = util::log::Severity::ERROR;
+      break;
+    case rocksdb::FATAL_LEVEL:
+      go_log_level = util::log::Severity::FATAL;
+      break;
+    case rocksdb::HEADER_LEVEL:
+      // There is no HEADER severity. Just give it INFO severity, then.
+      go_log_level = util::log::Severity::INFO;
+      break;
+    case rocksdb::NUM_INFO_LOG_LEVELS:
+      assert(false);
+      return;
+    }
+
     // First try with a small fixed size buffer.
     char space[1024];
 
@@ -61,7 +89,7 @@ class DBLogger : public rocksdb::Logger {
     va_end(backup_ap);
 
     if ((result >= 0) && (result < sizeof(space))) {
-      rocksDBLog(go_log_level_, space, result);
+      rocksDBLog(use_primary_log_, go_log_level, space, result);
       return;
     }
 
@@ -84,7 +112,7 @@ class DBLogger : public rocksdb::Logger {
 
       if ((result >= 0) && (result < length)) {
         // It fit
-        rocksDBLog(go_log_level_, buf, result);
+        rocksDBLog(use_primary_log_, go_log_level, buf, result);
         delete[] buf;
         return;
       }
@@ -92,13 +120,29 @@ class DBLogger : public rocksdb::Logger {
     }
   }
 
+  virtual void LogHeader(const char* format, va_list ap) override {
+    // RocksDB's `Logger::LogHeader()` implementation forgot to call the `Logv()` overload
+    // that takes severity info. Until it's fixed we can override their implementation.
+    Logv(rocksdb::InfoLogLevel::HEADER_LEVEL, format, ap);
+  }
+
+  virtual void Logv(const char* format, va_list ap) override {
+    // The RocksDB API tries to force us to separate the severity check (above function)
+    // from the actual logging (this function) by making this function pure virtual.
+    // However, when calling into Go, we need to provide severity level to both the severity
+    // level check function (`rocksDBV`) and the actual logging function (`rocksDBLog`). So,
+    // we do all the work in the function that has severity level and then expect this
+    // function to never be called.
+    assert(false);
+  }
+
  private:
-  int go_log_level_;
+  const bool use_primary_log_;
 };
 
 }  // namespace
 
-rocksdb::Logger* NewDBLogger(int go_log_level) { return new DBLogger(go_log_level); }
+rocksdb::Logger* NewDBLogger(bool use_primary_log) { return new DBLogger(use_primary_log); }
 
 rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   // Use the rocksdb options builder to configure the base options
@@ -108,22 +152,54 @@ rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   // number of cpus. Always use at least 2 threads, otherwise
   // compactions and flushes may fight with each other.
   options.IncreaseParallelism(std::max(db_opts.num_cpu, 2));
-  // Enable subcompactions which will use multiple threads to speed up
-  // a single compaction. The value of num_cpu/2 has not been tuned.
-  options.max_subcompactions = std::max(db_opts.num_cpu / 2, 1);
+  // Disable subcompactions since they're a less stable feature, and not
+  // necessary for our workload, where frequent fsyncs naturally prevent
+  // foreground writes from getting too far ahead of compactions.
+  options.max_subcompactions = 1;
   options.comparator = &kComparator;
   options.create_if_missing = !db_opts.must_exist;
-  options.info_log.reset(NewDBLogger(kDefaultLogLevel));
+  options.info_log.reset(NewDBLogger(false /* use_primary_log */));
   options.merge_operator.reset(NewMergeOperator());
   options.prefix_extractor.reset(new DBPrefixExtractor);
   options.statistics = rocksdb::CreateDBStatistics();
   options.max_open_files = db_opts.max_open_files;
   options.compaction_pri = rocksdb::kMinOverlappingRatio;
-  // Periodically sync both the WAL and SST writes to smooth out disk
-  // usage. Not performing such syncs can be faster but can cause
-  // performance blips when the OS decides it needs to flush data.
-  options.wal_bytes_per_sync = 512 << 10;  // 512 KB
-  options.bytes_per_sync = 512 << 10;      // 512 KB
+  // Periodically sync SST writes to smooth out disk usage. Not performing such
+  // syncs can be faster but can cause performance blips when the OS decides it
+  // needs to flush data.
+  options.bytes_per_sync = 512 << 10;  // 512 KB
+  // Enabling `strict_bytes_per_sync` prevents the situation where an SST is
+  // generated fast enough that the async writeback submissions fall behind.
+  // It enforces we wait for any previous `bytes_per_sync` sync to finish before
+  // issuing any future sync. That way we prevent situations where a huge amount
+  // of data gets written out all at once upon finishing a file (the final sync
+  // covers all the data, not just a range of size `bytes_per_sync`).
+  options.strict_bytes_per_sync = true;
+  // Do not sync the WAL periodically. We sync it every write already by calling
+  // `FlushWAL(true)` on non-temp stores. On the temp store we do not intend to
+  // sync WAL ever, so setting it to zero is fine there too.
+  options.wal_bytes_per_sync = 0;
+
+  // On ext4 and xfs, at least, `fallocate()`ing a large empty WAL is not enough
+  // to avoid inode writeback on every `fdatasync()`. Although `fallocate()` can
+  // preallocate space and preset the file size, it marks the preallocated
+  // "extents" as unwritten in the inode to guarantee readers cannot be exposed
+  // to data belonging to others. Every time `fdatasync()` happens, an inode
+  // writeback happens for the update to split an unwritten extent and mark part
+  // of it as written.
+  //
+  // Setting `recycle_log_file_num > 0` circumvents this as it'll eventually
+  // reuse WALs where extents are already all marked as written. When the DB
+  // opens, the first WAL will have its space preallocated as unwritten extents,
+  // so will still incur frequent inode writebacks. The second WAL will as well
+  // since the first WAL cannot be recycled until the first flush completes.
+  // From the third WAL onwards, however, we will have a previously written WAL
+  // readily available to recycle.
+  //
+  // We could pick a higher value if we see memtable flush backing up, or if we
+  // start using column families (WAL changes every time any column family
+  // initiates a flush, and WAL cannot be reused until that flush completes).
+  options.recycle_log_file_num = 1;
 
   // The size reads should be performed in for compaction. The
   // internets claim this can speed up compactions, though RocksDB
@@ -171,13 +247,29 @@ rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   // amplification.
   options.level0_file_num_compaction_trigger = 2;
   // Soft limit on number of L0 files. Writes are slowed down when
-  // this number is reached.
-  options.level0_slowdown_writes_trigger = 20;
+  // this number is reached. Bulk-ingestion can add lots of files
+  // suddenly, so setting this much higher should avoid spurious
+  // slowdowns to writes.
+  // TODO(dt): if/when we dynamically tune for bulk-ingestion, we
+  // could leave this at 20 and only raise it during ingest jobs.
+  options.level0_slowdown_writes_trigger = 950;
   // Maximum number of L0 files. Writes are stopped at this
   // point. This is set significantly higher than
   // level0_slowdown_writes_trigger to avoid completely blocking
   // writes.
-  options.level0_stop_writes_trigger = 32;
+  // TODO(dt): if/when we dynamically tune for bulk-ingestion, we
+  // could leave this at 30 and only raise it during ingest.
+  options.level0_stop_writes_trigger = 1000;
+  // Maximum estimated pending compaction bytes before slowing writes.
+  // Default is 64gb but that can be hit easily during bulk-ingestion since it
+  // is based on assumptions about relative level sizes that do not hold when
+  // adding data directly. Additionally some system-critical writes in
+  // cockroach (node-liveness), just can not be slow or they will fail and
+  // cause unavailability, so back-pressuring may *cause* unavailability,
+  // instead of gracefully slowing to some stable equilibrium to avoid it. As
+  // such, we want these set so they are impossible to hit.
+  options.soft_pending_compaction_bytes_limit = std::numeric_limits<uint64_t>::max();
+  options.hard_pending_compaction_bytes_limit = std::numeric_limits<uint64_t>::max();
   // Flush write buffers to L0 as soon as they are full. A higher
   // value could be beneficial if there are duplicate records in each
   // of the individual write buffers, but perf testing hasn't shown

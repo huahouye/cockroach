@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests_test
 
@@ -22,11 +18,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -38,6 +34,7 @@ func setDb(t *testing.T, db *gosql.DB, name string) {
 
 func TestCreateRandomSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 
@@ -51,7 +48,7 @@ func TestCreateRandomSchema(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	for i := 0; i < 100; i++ {
-		tab := sqlbase.RandCreateTable(rng, i)
+		tab := rowenc.RandCreateTable(rng, "table", i)
 		setDb(t, db, "test")
 		_, err := db.Exec(tab.String())
 		if err != nil {
@@ -69,7 +66,7 @@ func TestCreateRandomSchema(t *testing.T) {
 		}
 
 		// Reparse the show create table statement that's stored in the database.
-		stmtAst, err := parser.ParseOne(tabStmt)
+		parsed, err := parser.ParseOne(tabStmt)
 		if err != nil {
 			t.Fatalf("error parsing show create table: %s", err)
 		}
@@ -78,9 +75,9 @@ func TestCreateRandomSchema(t *testing.T) {
 		// Now run the SHOW CREATE TABLE statement we found on a new db and verify
 		// that both tables are the same.
 
-		_, err = db.Exec(stmtAst.String())
+		_, err = db.Exec(parsed.AST.String())
 		if err != nil {
-			t.Fatal(stmtAst, err)
+			t.Fatal(parsed.AST, err)
 		}
 
 		if err := db.QueryRow(fmt.Sprintf("SHOW CREATE TABLE %s",
@@ -92,14 +89,13 @@ func TestCreateRandomSchema(t *testing.T) {
 			t.Fatalf("found table name %s, expected %s", tabName, tab.Table.String())
 		}
 		// Reparse the show create table statement that's stored in the database.
-		var secondStmtAst tree.Statement
-		secondStmtAst, err = parser.ParseOne(secondTabStmt)
+		secondParsed, err := parser.ParseOne(secondTabStmt)
 		if err != nil {
 			t.Fatalf("error parsing show create table: %s", err)
 		}
-		if stmtAst.String() != secondStmtAst.String() {
+		if parsed.AST.String() != secondParsed.AST.String() {
 			t.Fatalf("for input statement\n%s\nfound first output\n%q\nbut second output\n%q",
-				tab.String(), stmtAst.String(), secondStmtAst.String())
+				tab.String(), parsed.AST.String(), secondParsed.AST.String())
 		}
 		if tabStmt != secondTabStmt {
 			t.Fatalf("for input statement\n%s\nfound first output\n%q\nbut second output\n%q",

@@ -1,43 +1,45 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"fmt"
-	"sort"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // mutationBuilder is a helper struct that supports building Insert, Update,
 // Upsert, and Delete operators in stages.
-// TODO(andyk): Add support for Upsert and Delete.
+// TODO(andyk): Add support for Delete.
 type mutationBuilder struct {
 	b  *Builder
 	md *opt.Metadata
 
-	// op is InsertOp, UpdateOp, UpsertOp, or DeleteOp.
-	op opt.Operator
+	// opName is the statement's name, used in error messages.
+	opName string
 
 	// tab is the target table.
 	tab cat.Table
@@ -46,8 +48,13 @@ type mutationBuilder struct {
 	tabID opt.TableID
 
 	// alias is the table alias specified in the mutation statement, or just the
-	// table name itself if no alias was specified.
-	alias *tree.TableName
+	// resolved table name if no alias was specified.
+	alias tree.TableName
+
+	// outScope contains the current set of columns that are in scope, as well as
+	// the output expression as it is incrementally built. Once the final mutation
+	// expression is completed, it will be contained in outScope.expr.
+	outScope *scope
 
 	// targetColList is an ordered list of IDs of the table columns into which
 	// values will be inserted, or which will be updated with new values. It is
@@ -57,257 +64,340 @@ type mutationBuilder struct {
 	// targetColSet contains the same column IDs as targetColList, but as a set.
 	targetColSet opt.ColSet
 
-	// insertColList is an ordered list of IDs of input columns which provide
-	// values to be inserted. Its length is always equal to the number of columns
-	// in the target table, including mutation columns. Table columns which will
-	// not have values inserted are set to zero (e.g. delete-only mutation
-	// columns). insertColList is empty if this is not an Insert operator.
-	insertColList opt.ColList
+	// insertColIDs lists the input column IDs providing values to insert. Its
+	// length is always equal to the number of columns in the target table,
+	// including mutation columns. Table columns which will not have values
+	// inserted are set to 0 (e.g. delete-only mutation columns). insertColIDs
+	// is empty if this is not an Insert/Upsert operator.
+	insertColIDs opt.ColList
 
-	// fetchColList is an ordered list of IDs of input columns which are fetched
-	// from a target table in order to provide existing values that will form
+	// fetchColIDs lists the input column IDs storing values which are fetched
+	// from the target table in order to provide existing values that will form
 	// lookup and update values. Its length is always equal to the number of
 	// columns in the target table, including mutation columns. Table columns
-	// which do not need to be fetched are set to zero. fetchColList is empty if
-	// this is an Insert operator with no ON CONFLICT clause.
-	fetchColList opt.ColList
+	// which do not need to be fetched are set to 0. fetchColIDs is empty if
+	// this is an Insert operator.
+	fetchColIDs opt.ColList
 
-	// updateColList is an ordered list of IDs of input columns which contain new
-	// updated values for columns in a target table. Its length is always equal
-	// to the number of columns in the target table, including mutation columns.
-	// Table columns which do not need to be updated are set to zero.
-	// updateColList is empty if this is an Insert operator with no ON CONFLICT
-	// clause.
-	updateColList opt.ColList
+	// updateColIDs lists the input column IDs providing update values. Its
+	// length is always equal to the number of columns in the target table,
+	// including mutation columns. Table columns which do not need to be
+	// updated are set to 0.
+	updateColIDs opt.ColList
+
+	// upsertColIDs lists the input column IDs that choose between an insert or
+	// update column using a CASE expression:
+	//
+	//   CASE WHEN canary_col IS NULL THEN ins_col ELSE upd_col END
+	//
+	// These columns are used to compute constraints and to return result rows.
+	// The length of upsertColIDs is always equal to the number of columns in
+	// the target table, including mutation columns. Table columns which do not
+	// need to be updated are set to 0. upsertColIDs is empty if this is not
+	// an Upsert operator.
+	upsertColIDs opt.ColList
+
+	// checkColIDs lists the input column IDs storing the boolean results of
+	// evaluating check constraint expressions defined on the target table. Its
+	// length is always equal to the number of check constraints on the table
+	// (see opt.Table.CheckCount).
+	checkColIDs opt.ColList
+
+	// partialIndexPutColIDs lists the input column IDs storing the boolean
+	// results of evaluating partial index predicate expressions of the target
+	// table. The predicate expressions are evaluated with their variables
+	// assigned from newly inserted or updated row values. When these columns
+	// evaluate to true, it signifies that the inserted or updated row should be
+	// added to the corresponding partial index. The length of
+	// partialIndexPutColIDs is always equal to the number of partial indexes on
+	// the table.
+	partialIndexPutColIDs opt.ColList
+
+	// partialIndexDelColIDs lists the input column IDs storing the boolean
+	// results of evaluating partial index predicate expressions of the target
+	// table. The predicate expressions are evaluated with their variables
+	// assigned from existing row values of deleted or updated rows. When these
+	// columns evaluate to true, it signifies that the deleted or updated row
+	// should be removed from the corresponding partial index. The length of
+	// partialIndexPutColIDs is always equal to the number of partial indexes on
+	// the table.
+	partialIndexDelColIDs opt.ColList
+
+	// canaryColID is the ID of the column that is used to decide whether to
+	// insert or update each row. If the canary column's value is null, then it's
+	// an insert; otherwise it's an update.
+	canaryColID opt.ColumnID
+
+	// arbiters stores the ordinals of indexes that are used to detect conflicts
+	// for UPSERT and INSERT ON CONFLICT statements.
+	arbiters cat.IndexOrdinals
+
+	// roundedDecimalCols is the set of columns that have already been rounded.
+	// Keeping this set avoids rounding the same column multiple times.
+	roundedDecimalCols opt.ColSet
 
 	// subqueries temporarily stores subqueries that were built during initial
 	// analysis of SET expressions. They will be used later when the subqueries
 	// are joined into larger LEFT OUTER JOIN expressions.
 	subqueries []*scope
 
-	// parsedExprs is a cached set of parsed default and computed expressions
+	// parsedColExprs is a cached set of parsed default and computed expressions
 	// from the table schema. These are parsed once and cached for reuse.
-	parsedExprs []tree.Expr
+	parsedColExprs []tree.Expr
 
-	// outScope contains the current set of columns that are in scope, as well as
-	// the output expression as it is incrementally built. Once the final Insert
-	// expression is completed, it will be contained in outScope.expr.
-	outScope *scope
+	// parsedIndexExprs is a cached set of parsed partial index predicate
+	// expressions from the table schema. These are parsed once and cached for
+	// reuse.
+	parsedIndexExprs []tree.Expr
+
+	// checks contains foreign key check queries; see buildFK* methods.
+	checks memo.FKChecksExpr
+
+	// cascades contains foreign key check cascades; see buildFK* methods.
+	cascades memo.FKCascades
+
+	// withID is nonzero if we need to buffer the input for FK checks.
+	withID opt.WithID
+
+	// extraAccessibleCols stores all the columns that are available to the
+	// mutation that are not part of the target table. This is useful for
+	// UPDATE ... FROM queries, as the columns from the FROM tables must be
+	// made accessible to the RETURNING clause.
+	extraAccessibleCols []scopeColumn
+
+	// fkCheckHelper is used to prevent allocating the helper separately.
+	fkCheckHelper fkCheckHelper
 }
 
-func (mb *mutationBuilder) init(b *Builder, op opt.Operator, tab cat.Table, alias *tree.TableName) {
+func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
 	mb.b = b
 	mb.md = b.factory.Metadata()
-	mb.op = op
+	mb.opName = opName
 	mb.tab = tab
-	mb.targetColList = make(opt.ColList, 0, tab.ColumnCount())
+	mb.alias = alias
 
-	if op == opt.InsertOp {
-		mb.insertColList = make(opt.ColList, cap(mb.targetColList))
-	}
-	if op == opt.UpdateOp {
-		mb.fetchColList = make(opt.ColList, cap(mb.targetColList))
-		mb.updateColList = make(opt.ColList, cap(mb.targetColList))
-	}
+	n := tab.ColumnCount()
+	mb.targetColList = make(opt.ColList, 0, n)
 
-	if alias != nil {
-		mb.alias = alias
-	} else {
-		mb.alias = tab.Name()
-	}
+	// Allocate segmented array of column IDs.
+	numPartialIndexes := partialIndexCount(tab)
+	colIDs := make(opt.ColList, n*4+tab.CheckCount()+2*numPartialIndexes)
+	mb.insertColIDs = colIDs[:n]
+	mb.fetchColIDs = colIDs[n : n*2]
+	mb.updateColIDs = colIDs[n*2 : n*3]
+	mb.upsertColIDs = colIDs[n*3 : n*4]
+	mb.checkColIDs = colIDs[n*4 : n*4+tab.CheckCount()]
+	mb.partialIndexPutColIDs = colIDs[n*4+tab.CheckCount() : n*4+tab.CheckCount()+numPartialIndexes]
+	mb.partialIndexDelColIDs = colIDs[n*4+tab.CheckCount()+numPartialIndexes:]
 
 	// Add the table and its columns (including mutation columns) to metadata.
-	mb.tabID = mb.md.AddTable(tab)
-	if alias != nil {
-		// Set the table alias for pretty-printing and EXPLAIN.
-		mb.md.TableMeta(mb.tabID).Alias = string(alias.TableName)
-	}
+	mb.tabID = mb.md.AddTable(tab, &mb.alias)
 }
 
-// addTargetNamedColsForInsert adds a list of user-specified column names to the
-// list of table columns that are the target of the Insert operation.
-func (mb *mutationBuilder) addTargetNamedColsForInsert(names tree.NameList) {
-	if len(mb.targetColList) != 0 {
-		panic("addTargetNamedColsForInsert cannot be called more than once")
-	}
-
-	// Add target table columns by the names specified in the Insert statement.
-	mb.addTargetColsByName(names)
-
-	// Ensure that primary key columns are in the target column list, or that
-	// they have default values.
-	mb.checkPrimaryKeyForInsert()
-
-	// Ensure that foreign keys columns are in the target column list, or that
-	// they have default values.
-	mb.checkForeignKeysForInsert()
-}
-
-// checkPrimaryKeyForInsert ensures that the columns of the primary key are
-// either assigned values by the INSERT statement, or else have default/computed
-// values. If neither condition is true, checkPrimaryKeyForInsert raises an
-// error.
-func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
-	primary := mb.tab.Index(cat.PrimaryIndex)
-	for i, n := 0, primary.KeyColumnCount(); i < n; i++ {
-		col := primary.Column(i)
-		if col.Column.HasDefault() || col.Column.IsComputed() {
-			// The column has a default or computed value.
-			continue
-		}
-
-		colID := mb.tabID.ColumnID(col.Ordinal)
-		if mb.targetColSet.Contains(int(colID)) {
-			// The column is explicitly specified in the target name list.
-			continue
-		}
-
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeInvalidForeignKeyError,
-			"missing %q primary key column", col.Column.ColName())})
-	}
-}
-
-// checkForeignKeysForInsert ensures that all composite foreign keys that
-// specify the matching method as MATCH FULL have all of their columns assigned
-// values by the INSERT statement, or else have default/computed values.
-// Alternatively, all columns can be unspecified. If neither condition is true,
-// checkForeignKeys raises an error. Here is an example:
-//
-//   CREATE TABLE orders (
-//     id INT,
-//     cust_id INT,
-//     state STRING,
-//     FOREIGN KEY (cust_id, state) REFERENCES customers (id, state) MATCH FULL
-//   )
-//
-//   INSERT INTO orders (cust_id) VALUES (1)
-//
-// This INSERT statement would trigger a static error, because only cust_id is
-// specified in the INSERT statement. Either the state column must be specified
-// as well, or else neither column can be specified.
-func (mb *mutationBuilder) checkForeignKeysForInsert() {
-	for i, n := 0, mb.tab.IndexCount(); i < n; i++ {
-		idx := mb.tab.Index(i)
-		fkey, ok := idx.ForeignKey()
-		if !ok {
-			continue
-		}
-
-		// This check should only be performed on composite foreign keys that use
-		// the MATCH FULL method.
-		if fkey.Match != tree.MatchFull {
-			continue
-		}
-
-		var missingCols []string
-		allMissing := true
-		for j := 0; j < int(fkey.PrefixLen); j++ {
-			indexCol := idx.Column(j)
-			if indexCol.Column.HasDefault() || indexCol.Column.IsComputed() {
-				// The column has a default value.
-				allMissing = false
-				continue
-			}
-
-			colID := mb.tabID.ColumnID(indexCol.Ordinal)
-			if mb.targetColSet.Contains(int(colID)) {
-				// The column is explicitly specified in the target name list.
-				allMissing = false
-				continue
-			}
-
-			missingCols = append(missingCols, string(indexCol.Column.ColName()))
-		}
-		if allMissing {
-			continue
-		}
-
-		switch len(missingCols) {
-		case 0:
-			// Do nothing.
-		case 1:
-			panic(builderError{errors.Errorf(
-				"missing value for column %q in multi-part foreign key", missingCols[0])})
-		default:
-			sort.Strings(missingCols)
-			panic(builderError{errors.Errorf(
-				"missing values for columns %q in multi-part foreign key", missingCols)})
+// setFetchColIDs sets the list of columns that are fetched in order to provide
+// values to the mutation operator. The given columns must come from buildScan.
+func (mb *mutationBuilder) setFetchColIDs(cols []scopeColumn) {
+	for i := range cols {
+		// Ensure that we don't add system columns to the fetch columns.
+		if cols[i].kind != cat.System {
+			mb.fetchColIDs[cols[i].tableOrdinal] = cols[i].id
 		}
 	}
 }
 
-// addTargetTableColsForInsert adds up to maxCols columns to the list of columns
-// that will be set by an INSERT operation. Columns are added from the target
-// table in the same order they appear in its schema. This method is used when
-// the target columns are not explicitly specified in the INSERT statement:
+// buildInputForUpdate constructs a Select expression from the fields in
+// the Update operator, similar to this:
 //
-//   INSERT INTO t VALUES (1, 2, 3)
+//   SELECT <cols>
+//   FROM <table>
+//   WHERE <where>
+//   ORDER BY <order-by>
+//   LIMIT <limit>
 //
-// In this example, the first three columns of table t would be added as target
-// columns.
-func (mb *mutationBuilder) addTargetTableColsForInsert(maxCols int) {
-	if len(mb.targetColList) != 0 {
-		panic("addTargetTableColsForInsert cannot be called more than once")
+// All columns from the table to update are added to fetchColList.
+// If a FROM clause is defined, we build out each of the table
+// expressions required and JOIN them together (LATERAL joins between
+// the tables are allowed). We then JOIN the result with the target
+// table (the FROM tables can't reference this table) and apply the
+// appropriate WHERE conditions.
+//
+// It is the responsibility of the user to guarantee that the JOIN
+// produces a maximum of one row per row of the target table. If multiple
+// are found, an arbitrary one is chosen (this row is not readily
+// predictable, consistent with the POSTGRES implementation).
+// buildInputForUpdate stores the columns of the FROM tables in the
+// mutation builder so they can be made accessible to other parts of
+// the query (RETURNING clause).
+// TODO(andyk): Do needed column analysis to project fewer columns if possible.
+func (mb *mutationBuilder) buildInputForUpdate(
+	inScope *scope,
+	texpr tree.TableExpr,
+	from tree.TableExprs,
+	where *tree.Where,
+	limit *tree.Limit,
+	orderBy tree.OrderBy,
+) {
+	var indexFlags *tree.IndexFlags
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok && source.IndexFlags != nil {
+		indexFlags = source.IndexFlags
+		telemetry.Inc(sqltelemetry.IndexHintUseCounter)
+		telemetry.Inc(sqltelemetry.IndexHintUpdateUseCounter)
 	}
 
-	numCols := 0
-	for i, n := 0, mb.tab.ColumnCount(); i < n && numCols < maxCols; i++ {
-		// Skip hidden columns.
-		if mb.tab.Column(i).IsHidden() {
-			continue
+	// Fetch columns from different instance of the table metadata, so that it's
+	// possible to remap columns, as in this example:
+	//
+	//   UPDATE abc SET a=b
+	//
+	// NOTE: Include mutation columns, but be careful to never use them for any
+	//       reason other than as "fetch columns". See buildScan comment.
+	scanScope := mb.b.buildScan(
+		mb.b.addTable(mb.tab, &mb.alias),
+		tableOrdinals(mb.tab, columnKinds{
+			includeMutations: true,
+			includeSystem:    true,
+			includeVirtual:   false,
+		}),
+		indexFlags,
+		noRowLocking,
+		inScope,
+	)
+	mb.outScope = scanScope
+
+	// Set list of columns that will be fetched by the input expression.
+	mb.setFetchColIDs(mb.outScope.cols)
+
+	// If there is a FROM clause present, we must join all the tables
+	// together with the table being updated.
+	fromClausePresent := len(from) > 0
+	if fromClausePresent {
+		fromScope := mb.b.buildFromTables(from, noRowLocking, inScope)
+
+		// Check that the same table name is not used multiple times.
+		mb.b.validateJoinTableNames(mb.outScope, fromScope)
+
+		// The FROM table columns can be accessed by the RETURNING clause of the
+		// query and so we have to make them accessible.
+		mb.extraAccessibleCols = fromScope.cols
+
+		// Add the columns in the FROM scope.
+		mb.outScope.appendColumnsFromScope(fromScope)
+
+		left := mb.outScope.expr.(memo.RelExpr)
+		right := fromScope.expr.(memo.RelExpr)
+		mb.outScope.expr = mb.b.factory.ConstructInnerJoin(left, right, memo.TrueFilter, memo.EmptyJoinPrivate)
+	}
+
+	// WHERE
+	mb.b.buildWhere(where, mb.outScope)
+
+	// SELECT + ORDER BY (which may add projected expressions)
+	projectionsScope := mb.outScope.replace()
+	projectionsScope.appendColumnsFromScope(mb.outScope)
+	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope)
+	mb.b.buildOrderBy(mb.outScope, projectionsScope, orderByScope)
+	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
+
+	// LIMIT
+	if limit != nil {
+		mb.b.buildLimit(limit, inScope, projectionsScope)
+	}
+
+	mb.outScope = projectionsScope
+
+	// Build a distinct on to ensure there is at most one row in the joined output
+	// for every row in the table.
+	if fromClausePresent {
+		var pkCols opt.ColSet
+
+		// We need to ensure that the join has a maximum of one row for every row
+		// in the table and we ensure this by constructing a distinct on the primary
+		// key columns.
+		primaryIndex := mb.tab.Index(cat.PrimaryIndex)
+		for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
+			pkCol := mb.outScope.cols[primaryIndex.Column(i).Ordinal()]
+
+			// If the primary key column is hidden, then we don't need to use it
+			// for the distinct on.
+			if !pkCol.hidden {
+				pkCols.Add(pkCol.id)
+			}
 		}
 
-		mb.addTargetCol(i)
-		numCols++
+		if !pkCols.Empty() {
+			mb.outScope = mb.b.buildDistinctOn(
+				pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
+		}
 	}
 
-	// Ensure that the number of input columns does not exceed the number of
-	// target columns.
-	mb.checkNumCols(len(mb.targetColList), maxCols)
+	// Add partial index del boolean columns to the input.
+	mb.projectPartialIndexDelCols(scanScope)
 }
 
-// addTargetColsForUpdate compiles the given SET expressions and adds the user-
-// specified column names to the list of table columns that will be updated by
-// the Update operation. Verify that the RHS of the SET expression provides
-// exactly as many columns as are expected by the named SET columns.
-func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
-	if len(mb.targetColList) != 0 {
-		panic("addTargetColsForUpdate cannot be called more than once")
+// buildInputForDelete constructs a Select expression from the fields in
+// the Delete operator, similar to this:
+//
+//   SELECT <cols>
+//   FROM <table>
+//   WHERE <where>
+//   ORDER BY <order-by>
+//   LIMIT <limit>
+//
+// All columns from the table to update are added to fetchColList.
+// TODO(andyk): Do needed column analysis to project fewer columns if possible.
+func (mb *mutationBuilder) buildInputForDelete(
+	inScope *scope, texpr tree.TableExpr, where *tree.Where, limit *tree.Limit, orderBy tree.OrderBy,
+) {
+	var indexFlags *tree.IndexFlags
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok && source.IndexFlags != nil {
+		indexFlags = source.IndexFlags
+		telemetry.Inc(sqltelemetry.IndexHintUseCounter)
+		telemetry.Inc(sqltelemetry.IndexHintDeleteUseCounter)
 	}
 
-	for _, expr := range exprs {
-		mb.addTargetColsByName(expr.Names)
+	// Fetch columns from different instance of the table metadata, so that it's
+	// possible to remap columns, as in this example:
+	//
+	//   DELETE FROM abc WHERE a=b
+	//
+	// NOTE: Include mutation columns, but be careful to never use them for any
+	//       reason other than as "fetch columns". See buildScan comment.
+	// TODO(andyk): Why does execution engine need mutation columns for Delete?
+	scanScope := mb.b.buildScan(
+		mb.b.addTable(mb.tab, &mb.alias),
+		tableOrdinals(mb.tab, columnKinds{
+			includeMutations: true,
+			includeSystem:    true,
+			includeVirtual:   false,
+		}),
+		indexFlags,
+		noRowLocking,
+		inScope,
+	)
+	mb.outScope = scanScope
 
-		if expr.Tuple {
-			n := -1
-			switch t := expr.Expr.(type) {
-			case *tree.Subquery:
-				// Build the subquery in order to determine how many columns it
-				// projects, and store it for later use in the addUpdateCols method.
-				// Use the data types of the target columns to resolve expressions
-				// with ambiguous types (e.g. should 1 be interpreted as an INT or
-				// as a FLOAT).
-				desiredTypes := make([]types.T, len(expr.Names))
-				targetIdx := len(mb.targetColList) - len(expr.Names)
-				for i := range desiredTypes {
-					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
-				}
-				outScope := mb.b.buildSelectStmt(t.Select, desiredTypes, mb.outScope)
-				mb.subqueries = append(mb.subqueries, outScope)
-				n = len(outScope.cols)
+	// WHERE
+	mb.b.buildWhere(where, mb.outScope)
 
-			case *tree.Tuple:
-				n = len(t.Exprs)
-			}
-			if n < 0 {
-				panic(builderError{errors.Errorf("unsupported tuple assignment: %T", expr.Expr)})
-			}
-			if len(expr.Names) != n {
-				panic(builderError{fmt.Errorf("number of columns (%d) does not match number of values (%d)",
-					len(expr.Names), n)})
-			}
-		}
+	// SELECT + ORDER BY (which may add projected expressions)
+	projectionsScope := mb.outScope.replace()
+	projectionsScope.appendColumnsFromScope(mb.outScope)
+	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope)
+	mb.b.buildOrderBy(mb.outScope, projectionsScope, orderByScope)
+	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
+
+	// LIMIT
+	if limit != nil {
+		mb.b.buildLimit(limit, inScope, projectionsScope)
 	}
+
+	mb.outScope = projectionsScope
+
+	// Set list of columns that will be fetched by the input expression.
+	mb.setFetchColIDs(mb.outScope.cols)
+
+	// Add partial index boolean columns to the input.
+	mb.projectPartialIndexDelCols(scanScope)
 }
 
 // addTargetColsByName adds one target column for each of the names in the given
@@ -316,17 +406,15 @@ func (mb *mutationBuilder) addTargetColsByName(names tree.NameList) {
 	for _, name := range names {
 		// Determine the ordinal position of the named column in the table and
 		// add it as a target column.
-		found := false
-		for ord, n := 0, mb.tab.ColumnCount(); ord < n; ord++ {
-			if mb.tab.Column(ord).ColName() == name {
-				mb.addTargetCol(ord)
-				found = true
-				break
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			// System columns are invalid target columns.
+			if mb.tab.Column(ord).Kind() == cat.System {
+				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
 			}
+			mb.addTargetCol(ord)
+			continue
 		}
-		if !found {
-			panic(builderError{sqlbase.NewUndefinedColumnError(string(name))})
-		}
+		panic(colinfo.NewUndefinedColumnError(string(name)))
 	}
 }
 
@@ -337,21 +425,22 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 	tabCol := mb.tab.Column(ord)
 
 	// Don't allow targeting of mutation columns.
-	if cat.IsMutationColumn(mb.tab, ord) {
-		panic(builderError{makeBackfillError(tabCol.ColName())})
+	if tabCol.IsMutation() {
+		panic(makeBackfillError(tabCol.ColName()))
 	}
 
 	// Computed columns cannot be targeted with input values.
 	if tabCol.IsComputed() {
-		panic(builderError{sqlbase.CannotWriteToComputedColError(string(tabCol.ColName()))})
+		panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
 	}
 
 	// Ensure that the name list does not contain duplicates.
 	colID := mb.tabID.ColumnID(ord)
-	if mb.targetColSet.Contains(int(colID)) {
-		panic(builderError{fmt.Errorf("multiple assignments to the same column %q", tabCol.ColName())})
+	if mb.targetColSet.Contains(colID) {
+		panic(pgerror.Newf(pgcode.Syntax,
+			"multiple assignments to the same column %q", tabCol.ColName()))
 	}
-	mb.targetColSet.Add(int(colID))
+	mb.targetColSet.Add(colID)
 
 	mb.targetColList = append(mb.targetColList, colID)
 }
@@ -447,302 +536,45 @@ func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tr
 	return inRows
 }
 
-// buildInputForInsert constructs the memo group for the input expression and
-// constructs a new output scope containing that expression's output columns.
-func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.Select) {
-	// If there are already required target columns, then those will provide
-	// desired input types. Otherwise, input columns are mapped to the table's
-	// non-hidden columns by corresponding ordinal position. Exclude hidden
-	// columns to prevent this statement from writing hidden columns:
-	//
-	//   INSERT INTO <table> VALUES (...)
-	//
-	// However, hidden columns can be written if the target columns were
-	// explicitly specified:
-	//
-	//   INSERT INTO <table> (...) VALUES (...)
-	//
-	var desiredTypes []types.T
-	if len(mb.targetColList) != 0 {
-		desiredTypes = make([]types.T, len(mb.targetColList))
-		for i, colID := range mb.targetColList {
-			desiredTypes[i] = mb.md.ColumnMeta(colID).Type
-		}
-	} else {
-		desiredTypes = make([]types.T, 0, mb.tab.ColumnCount())
-		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-			tabCol := mb.tab.Column(i)
-			if !tabCol.IsHidden() {
-				desiredTypes = append(desiredTypes, tabCol.DatumType())
-			}
-		}
-	}
-
-	mb.outScope = mb.b.buildSelect(inputRows, desiredTypes, inScope)
-
-	if len(mb.targetColList) != 0 {
-		// Target columns already exist, so ensure that the number of input
-		// columns exactly matches the number of target columns.
-		mb.checkNumCols(len(mb.targetColList), len(mb.outScope.cols))
-	} else {
-		// No target columns have been added by previous steps, so add columns
-		// that are implicitly targeted by the input expression.
-		mb.addTargetTableColsForInsert(len(mb.outScope.cols))
-	}
-
-	// Loop over input columns and:
-	//   1. Type check each column
-	//   2. Assign name to each column
-	//   3. Add id of each column to the insertColList
-	for i := range mb.outScope.cols {
-		inCol := &mb.outScope.cols[i]
-		ord := mb.tabID.ColumnOrdinal(mb.targetColList[i])
-
-		// Type check the input column against the corresponding table column.
-		checkDatumTypeFitsColumnType(mb.tab.Column(ord), inCol.typ)
-
-		// Assign name of input column. Computed columns can refer to this column
-		// by its name.
-		inCol.name = tree.Name(mb.md.ColumnMeta(mb.targetColList[i]).Alias)
-
-		// Map the ordinal position of each table column to the id of the input
-		// column which will be inserted into that position.
-		mb.insertColList[ord] = inCol.id
-	}
-}
-
-// buildEmptyInput constructs a new output scope containing a single row VALUES
-// expression with zero columns.
-func (mb *mutationBuilder) buildEmptyInput(inScope *scope) {
-	mb.outScope = inScope.push()
-	mb.outScope.expr = mb.b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, opt.ColList{})
-}
-
-// buildInputForUpdate constructs a Select expression from the fields in the
-// Update operator, similar to this:
-//
-//   SELECT <cols>
-//   FROM <table>
-//   WHERE <where>
-//   ORDER BY <order-by>
-//   LIMIT <limit>
-//
-// All columns from the table to update are added to fetchColList.
-// TODO(andyk): Do needed column analysis to project fewer columns if possible.
-func (mb *mutationBuilder) buildInputForUpdate(inScope *scope, upd *tree.Update) {
-	// FROM
-	mb.outScope = mb.b.buildScan(
-		mb.tab,
-		mb.alias,
-		nil, /* ordinals */
-		nil, /* indexFlags */
-		includeMutations,
-		inScope,
-	)
-
-	// WHERE
-	mb.b.buildWhere(upd.Where, mb.outScope)
-
-	// SELECT + ORDER BY (which may add projected expressions)
-	projectionsScope := mb.outScope.replace()
-	projectionsScope.appendColumnsFromScope(mb.outScope)
-	orderByScope := mb.b.analyzeOrderBy(upd.OrderBy, mb.outScope, projectionsScope)
-	mb.b.buildOrderBy(mb.outScope, projectionsScope, orderByScope)
-	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
-
-	// LIMIT
-	if upd.Limit != nil {
-		mb.b.buildLimit(upd.Limit, inScope, projectionsScope)
-	}
-
-	mb.outScope = projectionsScope
-
-	// Set list of columns that will be fetched by the input expression.
-	for i := range mb.outScope.cols {
-		mb.fetchColList[i] = mb.outScope.cols[i].id
-	}
-}
-
-// addUpdateCols builds nested Project and LeftOuterJoin expressions that
-// correspond to the given SET expressions:
-//
-//   SET a=1 (single-column SET)
-//     Add as synthesized Project column:
-//       SELECT <fetch-cols>, 1 FROM <input>
-//
-//   SET (a, b)=(1, 2) (tuple SET)
-//     Add as multiple Project columns:
-//       SELECT <fetch-cols>, 1, 2 FROM <input>
-//
-//   SET (a, b)=(SELECT 1, 2) (subquery)
-//     Wrap input in Max1Row + LeftJoinApply expressions:
-//       SELECT * FROM <fetch-cols> LEFT JOIN LATERAL (SELECT 1, 2) ON True
-//
-// Multiple subqueries result in multiple left joins successively wrapping the
-// input. A final Project operator is built if any single-column or tuple SET
-// expressions are present.
-func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
-	// SET expressions should reject aggregates, generators, etc.
-	scalarProps := &mb.b.semaCtx.Properties
-	defer scalarProps.Restore(*scalarProps)
-	mb.b.semaCtx.Properties.Require("UPDATE SET", tree.RejectSpecial)
-
-	// UPDATE input columns are accessible to SET expressions.
-	inScope := mb.outScope
-
-	// Project additional column(s) for each update expression (can be multiple
-	// columns in case of tuple assignment).
-	projectionsScope := mb.outScope.replace()
-	projectionsScope.appendColumnsFromScope(mb.outScope)
-
-	checkCol := func(sourceCol *scopeColumn, targetColID opt.ColumnID) {
-		// Type check the input expression against the corresponding table column.
-		ord := mb.tabID.ColumnOrdinal(targetColID)
-		checkDatumTypeFitsColumnType(mb.tab.Column(ord), sourceCol.typ)
-
-		// Add new column ID to the list of columns to update.
-		mb.updateColList[ord] = sourceCol.id
-
-		// "Shadow" the existing column of the same name, since any future
-		// references (like computed expressions) should point to the new column
-		// containing the updated value rather than the old column containing the
-		// original value. The old columns need to be retained in the projection
-		// because some original values are needed to formulate the update keys.
-		projectionsScope.cols[ord].name = ""
-		sourceCol.name = mb.tab.Column(ord).ColName()
-	}
-
-	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
-		// Allow right side of SET to be DEFAULT.
-		if _, ok := expr.(tree.DefaultVal); ok {
-			expr = mb.parseDefaultOrComputedExpr(targetColID)
-		}
-
-		// Add new column to the projections scope.
-		desiredType := mb.md.ColumnMeta(targetColID).Type
-		texpr := inScope.resolveType(expr, desiredType)
-		scopeCol := mb.b.addColumn(projectionsScope, "" /* label */, texpr)
-		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
-
-		checkCol(scopeCol, targetColID)
-	}
-
-	n := 0
-	subquery := 0
-	for _, set := range exprs {
-		if set.Tuple {
-			switch t := set.Expr.(type) {
-			case *tree.Subquery:
-				// Get the subquery scope that was built by addTargetColsForUpdate.
-				subqueryScope := mb.subqueries[subquery]
-				subquery++
-
-				// Type check and rename columns.
-				for i := range subqueryScope.cols {
-					checkCol(&subqueryScope.cols[i], mb.targetColList[n])
-					n++
-				}
-
-				// Lazily create new scope to hold results of join.
-				if mb.outScope == inScope {
-					mb.outScope = inScope.replace()
-					mb.outScope.appendColumnsFromScope(inScope)
-					mb.outScope.expr = inScope.expr
-				}
-
-				// Wrap input with Max1Row + LOJ.
-				mb.outScope.appendColumnsFromScope(subqueryScope)
-				mb.outScope.expr = mb.b.factory.ConstructLeftJoinApply(
-					mb.outScope.expr,
-					mb.b.factory.ConstructMax1Row(subqueryScope.expr),
-					memo.TrueFilter,
-				)
-
-				// Project all subquery output columns.
-				projectionsScope.appendColumnsFromScope(subqueryScope)
-
-			case *tree.Tuple:
-				for _, expr := range t.Exprs {
-					addCol(expr, mb.targetColList[n])
-					n++
-				}
-			}
-		} else {
-			addCol(set.Expr, mb.targetColList[n])
-			n++
-		}
-	}
-
-	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
-	mb.outScope = projectionsScope
-}
-
-// addDefaultAndComputedColsForInsert wraps an Insert input expression with
-// Project operator(s) containing any default (or nullable) and computed columns
-// that are not yet part of the target column list. This includes mutation
-// columns, since they must always have default or computed values.
-//
-// After this call, the input expression will provide values for every one of
-// the target table columns, whether it was explicitly specified or implicitly
-// added.
-func (mb *mutationBuilder) addDefaultAndComputedColsForInsert() {
-	// Add any missing default and nullable columns.
-	mb.addSynthesizedCols(
-		mb.insertColList,
-		func(tabCol cat.Column) bool { return !tabCol.IsComputed() },
-	)
-
-	// Add any missing computed columns. This must be done after adding default
-	// columns above, because computed columns can depend on default columns.
-	mb.addSynthesizedCols(
-		mb.insertColList,
-		func(tabCol cat.Column) bool { return tabCol.IsComputed() },
-	)
-}
-
-// addComputedColsForUpdate wraps an Update input expression with a Project
-// operator containing any computed columns that need to be updated. This
-// includes write-only mutation columns that are computed.
-func (mb *mutationBuilder) addComputedColsForUpdate() {
-	// Allow mutation columns to be referenced by other computed mutation columns
-	// (otherwise the scope will raise an error if a mutation column is
-	// referenced). These do not need to be set back to true again because
-	// mutation columns are not projected by the Update operator.
-	for i := range mb.outScope.cols {
-		mb.outScope.cols[i].mutation = false
-	}
-
-	mb.addSynthesizedCols(
-		mb.updateColList,
-		func(tabCol cat.Column) bool { return tabCol.IsComputed() },
-	)
-}
-
-// addSynthesizedCols is a helper method for addDefaultAndComputedColsForInsert
-// and addComputedColsForUpdate that scans the list of table columns, looking
+// addSynthesizedCols is a helper method for addSynthesizedColsForInsert
+// and addSynthesizedColsForUpdate that scans the list of table columns, looking
 // for any that do not yet have values provided by the input expression. New
 // columns are synthesized for any missing columns, as long as the addCol
 // callback function returns true for that column.
-func (mb *mutationBuilder) addSynthesizedCols(
-	colList opt.ColList, addCol func(tabCol cat.Column) bool,
-) {
+//
+// Values are synthesized for columns based on checking these rules, in order:
+//   1. If column is computed, evaluate that expression as its value.
+//   2. If column has a default value specified for it, use that as its value.
+//   3. If column is nullable, use NULL as its value.
+//   4. If column is currently being added or dropped (i.e. a mutation column),
+//      use a default value (0 for INT column, "" for STRING column, etc). Note
+//      that the existing "fetched" value returned by the scan cannot be used,
+//      since it may not have been initialized yet by the backfiller.
+//
+// NOTE: colIDs is updated with the column IDs of any synthesized columns which
+// are added to outScope.
+func (mb *mutationBuilder) addSynthesizedCols(colIDs opt.ColList, addCol func(colOrd int) bool) {
 	var projectionsScope *scope
 
 	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-		// Skip columns that are already specified.
-		if colList[i] != 0 {
-			continue
-		}
-
+		tabCol := mb.tab.Column(i)
+		kind := tabCol.Kind()
 		// Skip delete-only mutation columns, since they are ignored by all
 		// mutation operators that synthesize columns.
-		if mut, ok := mb.tab.Column(i).(*cat.MutationColumn); ok && mut.IsDeleteOnly {
+		if kind == cat.DeleteOnly {
+			continue
+		}
+		// Skip system and virtual columns.
+		if kind == cat.System || kind == cat.Virtual {
+			continue
+		}
+		// Skip columns that are already specified.
+		if colIDs[i] != 0 {
 			continue
 		}
 
 		// Invoke addCol to determine whether column should be added.
-		tabCol := mb.tab.Column(i)
-		if !addCol(tabCol) {
+		if !addCol(i) {
 			continue
 		}
 
@@ -754,20 +586,20 @@ func (mb *mutationBuilder) addSynthesizedCols(
 		}
 		tabColID := mb.tabID.ColumnID(i)
 		expr := mb.parseDefaultOrComputedExpr(tabColID)
-		texpr := mb.outScope.resolveType(expr, tabCol.DatumType())
-		scopeCol := mb.b.addColumn(projectionsScope, "" /* label */, texpr)
+		texpr := mb.outScope.resolveAndRequireType(expr, tabCol.DatumType())
+		scopeCol := mb.b.addColumn(projectionsScope, "" /* alias */, texpr)
 		mb.b.buildScalar(texpr, mb.outScope, projectionsScope, scopeCol, nil)
 
 		// Assign name to synthesized column. Computed columns may refer to default
 		// columns in the table by name.
 		scopeCol.name = tabCol.ColName()
 
-		// Store id of newly synthesized column in corresponding list slot.
-		colList[i] = scopeCol.id
+		// Remember id of newly synthesized column.
+		colIDs[i] = scopeCol.id
 
 		// Add corresponding target column.
 		mb.targetColList = append(mb.targetColList, tabColID)
-		mb.targetColSet.Add(int(tabColID))
+		mb.targetColSet.Add(tabColID)
 	}
 
 	if projectionsScope != nil {
@@ -776,31 +608,322 @@ func (mb *mutationBuilder) addSynthesizedCols(
 	}
 }
 
-// buildInsert constructs an Insert operator, possibly wrapped by a Project
-// operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
-	private := memo.MutationPrivate{
-		Table:       mb.tabID,
-		InsertCols:  mb.insertColList,
-		NeedResults: returning != nil,
-	}
-	mb.outScope.expr = mb.b.factory.ConstructInsert(mb.outScope.expr, &private)
+// roundDecimalValues wraps each DECIMAL-related column (including arrays of
+// decimals) with a call to the crdb_internal.round_decimal_values function, if
+// column values may need to be rounded. This is necessary when mutating table
+// columns that have a limited scale (e.g. DECIMAL(10, 1)). Here is the PG docs
+// description:
+//
+//   http://www.postgresql.org/docs/9.5/static/datatype-numeric.html
+//   "If the scale of a value to be stored is greater than
+//   the declared scale of the column, the system will round the
+//   value to the specified number of fractional digits. Then,
+//   if the number of digits to the left of the decimal point
+//   exceeds the declared precision minus the declared scale, an
+//   error is raised."
+//
+// Note that this function only handles the rounding portion of that. The
+// precision check is done by the execution engine. The rounding cannot be done
+// there, since it needs to happen before check constraints are computed, and
+// before UPSERT joins.
+//
+// If roundComputedCols is false, then don't wrap computed columns. If true,
+// then only wrap computed columns. This is necessary because computed columns
+// can depend on other columns mutated by the operation; it is necessary to
+// first round those values, then evaluated the computed expression, and then
+// round the result of the computation.
+//
+// roundDecimalValues will only round decimal columns that are part of the
+// colIDs list (i.e. are not 0). If a column is rounded, then the list will be
+// updated with the column ID of the new synthesized column.
+func (mb *mutationBuilder) roundDecimalValues(colIDs opt.ColList, roundComputedCols bool) {
+	var projectionsScope *scope
 
-	mb.buildReturning(returning)
+	for i, id := range colIDs {
+		if id == 0 {
+			// Column not mutated, so nothing to do.
+			continue
+		}
+
+		// Include or exclude computed columns, depending on the value of
+		// roundComputedCols.
+		col := mb.tab.Column(i)
+		if col.IsComputed() != roundComputedCols {
+			continue
+		}
+
+		// Check whether the target column's type may require rounding of the
+		// input value.
+		colType := col.DatumType()
+		precision, width := colType.Precision(), colType.Width()
+		if colType.Family() == types.ArrayFamily {
+			innerType := colType.ArrayContents()
+			if innerType.Family() == types.ArrayFamily {
+				panic(errors.AssertionFailedf("column type should never be a nested array"))
+			}
+			precision, width = innerType.Precision(), innerType.Width()
+		}
+
+		props, overload := findRoundingFunction(colType, precision)
+		if props == nil {
+			continue
+		}
+
+		// If column has already been rounded, then skip it.
+		if mb.roundedDecimalCols.Contains(id) {
+			continue
+		}
+
+		private := &memo.FunctionPrivate{
+			Name:       "crdb_internal.round_decimal_values",
+			Typ:        col.DatumType(),
+			Properties: props,
+			Overload:   overload,
+		}
+		variable := mb.b.factory.ConstructVariable(id)
+		scale := mb.b.factory.ConstructConstVal(tree.NewDInt(tree.DInt(width)), types.Int)
+		fn := mb.b.factory.ConstructFunction(memo.ScalarListExpr{variable, scale}, private)
+
+		// Lazily create new scope and update the scope column to be rounded.
+		if projectionsScope == nil {
+			projectionsScope = mb.outScope.replace()
+			projectionsScope.appendColumnsFromScope(mb.outScope)
+		}
+		scopeCol := projectionsScope.getColumn(id)
+		mb.b.populateSynthesizedColumn(scopeCol, fn)
+
+		// Overwrite the input column ID with the new synthesized column ID.
+		colIDs[i] = scopeCol.id
+		mb.roundedDecimalCols.Add(scopeCol.id)
+	}
+
+	if projectionsScope != nil {
+		mb.b.constructProjectForScope(mb.outScope, projectionsScope)
+		mb.outScope = projectionsScope
+	}
 }
 
-// buildUpdate constructs an Update operator, possibly wrapped by a Project
-// operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
-	private := memo.MutationPrivate{
-		Table:       mb.tabID,
-		FetchCols:   mb.fetchColList,
-		UpdateCols:  mb.updateColList,
-		NeedResults: returning != nil,
+// findRoundingFunction returns the builtin function overload needed to round
+// input values. This is only necessary for DECIMAL or DECIMAL[] types that have
+// limited precision, such as:
+//
+//   DECIMAL(15, 1)
+//   DECIMAL(10, 3)[]
+//
+// If an input decimal value has more than the required number of fractional
+// digits, it must be rounded before being inserted into these types.
+//
+// NOTE: CRDB does not allow nested array storage types, so only one level of
+// array nesting needs to be checked.
+func findRoundingFunction(
+	typ *types.T, precision int32,
+) (*tree.FunctionProperties, *tree.Overload) {
+	if precision == 0 {
+		// Unlimited precision decimal target type never needs rounding.
+		return nil, nil
 	}
-	mb.outScope.expr = mb.b.factory.ConstructUpdate(mb.outScope.expr, &private)
 
-	mb.buildReturning(returning)
+	props, overloads := builtins.GetBuiltinProperties("crdb_internal.round_decimal_values")
+
+	if typ.Equivalent(types.Decimal) {
+		return props, &overloads[0]
+	}
+	if typ.Equivalent(types.DecimalArray) {
+		return props, &overloads[1]
+	}
+
+	// Not DECIMAL or DECIMAL[].
+	return nil, nil
+}
+
+// addCheckConstraintCols synthesizes a boolean output column for each check
+// constraint defined on the target table. The mutation operator will report
+// a constraint violation error if the value of the column is false.
+func (mb *mutationBuilder) addCheckConstraintCols() {
+	if mb.tab.CheckCount() != 0 {
+		projectionsScope := mb.outScope.replace()
+		projectionsScope.appendColumnsFromScope(mb.outScope)
+
+		for i, n := 0, mb.tab.CheckCount(); i < n; i++ {
+			expr, err := parser.ParseExpr(mb.tab.Check(i).Constraint)
+			if err != nil {
+				panic(err)
+			}
+
+			alias := fmt.Sprintf("check%d", i+1)
+			texpr := mb.outScope.resolveAndRequireType(expr, types.Bool)
+			scopeCol := mb.b.addColumn(projectionsScope, alias, texpr)
+
+			// TODO(ridwanmsharif): Maybe we can avoid building constraints here
+			// and instead use the constraints stored in the table metadata.
+			mb.b.buildScalar(texpr, mb.outScope, projectionsScope, scopeCol, nil)
+			mb.checkColIDs[i] = scopeCol.id
+		}
+
+		mb.b.constructProjectForScope(mb.outScope, projectionsScope)
+		mb.outScope = projectionsScope
+	}
+}
+
+// projectPartialIndexPutCols builds a Project that synthesizes boolean output
+// columns for each partial index defined on the target table. The execution
+// code uses these booleans to determine whether or not to add a row in the
+// partial index.
+//
+// predScope is the scope of columns available to the partial index predicate
+// expression.
+func (mb *mutationBuilder) projectPartialIndexPutCols(predScope *scope) {
+	mb.projectPartialIndexCols(mb.partialIndexPutColIDs, predScope, "partial_index_put")
+}
+
+// projectPartialIndexPutCols builds a Project that synthesizes boolean output
+// columns for each partial index defined on the target table. The execution
+// code uses these booleans to determine whether or not to remove a row in the
+// partial index.
+//
+// predScope is the scope of columns available to the partial index predicate
+// expression.
+func (mb *mutationBuilder) projectPartialIndexDelCols(predScope *scope) {
+	mb.projectPartialIndexCols(mb.partialIndexDelColIDs, predScope, "partial_index_del")
+}
+
+// projectPartialIndexCols builds a Project that synthesizes boolean output
+// columns for each partial index defined on the target table.
+func (mb *mutationBuilder) projectPartialIndexCols(
+	colIDs opt.ColList, predScope *scope, aliasPrefix string,
+) {
+	if partialIndexCount(mb.tab) > 0 {
+		projectionScope := mb.outScope.replace()
+		projectionScope.appendColumnsFromScope(mb.outScope)
+
+		ord := 0
+		for i, n := 0, mb.tab.DeletableIndexCount(); i < n; i++ {
+			index := mb.tab.Index(i)
+			if _, isPartial := index.Predicate(); !isPartial {
+				continue
+			}
+
+			expr := mb.parsePartialIndexPredicateExpr(i)
+			texpr := predScope.resolveAndRequireType(expr, types.Bool)
+			alias := fmt.Sprintf("%s%d", aliasPrefix, ord+1)
+			scopeCol := mb.b.addColumn(projectionScope, alias, texpr)
+
+			mb.b.buildScalar(texpr, predScope, projectionScope, scopeCol, nil)
+			colIDs[ord] = scopeCol.id
+
+			ord++
+		}
+
+		mb.b.constructProjectForScope(mb.outScope, projectionScope)
+		mb.outScope = projectionScope
+	}
+}
+
+// disambiguateColumns ranges over the scope and ensures that at most one column
+// has each table column name, and that name refers to the column with the final
+// value that the mutation applies.
+func (mb *mutationBuilder) disambiguateColumns() {
+	// Determine the set of input columns that will have their names preserved.
+	var preserve opt.ColSet
+	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+		if colID := mb.mapToReturnColID(i); colID != 0 {
+			preserve.Add(colID)
+		}
+	}
+
+	// Clear names of all non-preserved columns.
+	for i := range mb.outScope.cols {
+		if !preserve.Contains(mb.outScope.cols[i].id) {
+			mb.outScope.cols[i].clearName()
+		}
+	}
+}
+
+// makeMutationPrivate builds a MutationPrivate struct containing the table and
+// column metadata needed for the mutation operator.
+func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationPrivate {
+	// Helper function that returns nil if there are no non-zero column IDs in a
+	// given list. A zero column ID indicates that column does not participate
+	// in this mutation operation.
+	checkEmptyList := func(colIDs opt.ColList) opt.ColList {
+		for _, id := range colIDs {
+			if id != 0 {
+				return colIDs
+			}
+		}
+		return nil
+	}
+
+	private := &memo.MutationPrivate{
+		Table:               mb.tabID,
+		InsertCols:          checkEmptyList(mb.insertColIDs),
+		FetchCols:           checkEmptyList(mb.fetchColIDs),
+		UpdateCols:          checkEmptyList(mb.updateColIDs),
+		CanaryCol:           mb.canaryColID,
+		Arbiters:            mb.arbiters,
+		CheckCols:           checkEmptyList(mb.checkColIDs),
+		PartialIndexPutCols: checkEmptyList(mb.partialIndexPutColIDs),
+		PartialIndexDelCols: checkEmptyList(mb.partialIndexDelColIDs),
+		FKCascades:          mb.cascades,
+	}
+
+	// If we didn't actually plan any checks or cascades, don't buffer the input.
+	if len(mb.checks) > 0 || len(mb.cascades) > 0 {
+		private.WithID = mb.withID
+	}
+
+	if needResults {
+		private.ReturnCols = make(opt.ColList, mb.tab.ColumnCount())
+		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+			if mb.tab.Column(i).Kind() != cat.Ordinary {
+				// Only non-mutation and non-system columns are output columns.
+				continue
+			}
+			retColID := mb.mapToReturnColID(i)
+			if retColID == 0 {
+				panic(errors.AssertionFailedf("column %d is not available in the mutation input", i))
+			}
+			private.ReturnCols[i] = retColID
+		}
+	}
+
+	return private
+}
+
+// mapToReturnColID returns the ID of the input column that provides the final
+// value for the column at the given ordinal position in the table. This value
+// might mutate the column, or it might be returned by the mutation statement,
+// or it might not be used at all. Columns take priority in this order:
+//
+//   upsert, update, fetch, insert
+//
+// If an upsert column is available, then it already combines an update/fetch
+// value with an insert value, so it takes priority. If an update column is
+// available, then it overrides any fetch value. Finally, the relative priority
+// of fetch and insert columns doesn't matter, since they're only used together
+// in the upsert case where an upsert column would be available.
+//
+// If the column is never referenced by the statement, then mapToReturnColID
+// returns 0. This would be the case for delete-only columns in an Insert
+// statement, because they're neither fetched nor mutated.
+func (mb *mutationBuilder) mapToReturnColID(tabOrd int) opt.ColumnID {
+	switch {
+	case mb.upsertColIDs[tabOrd] != 0:
+		return mb.upsertColIDs[tabOrd]
+
+	case mb.updateColIDs[tabOrd] != 0:
+		return mb.updateColIDs[tabOrd]
+
+	case mb.fetchColIDs[tabOrd] != 0:
+		return mb.fetchColIDs[tabOrd]
+
+	case mb.insertColIDs[tabOrd] != 0:
+		return mb.insertColIDs[tabOrd]
+
+	default:
+		// Column is never referenced by the statement.
+		return 0
+	}
 }
 
 // buildReturning wraps the input expression with a Project operator that
@@ -808,7 +931,9 @@ func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 	// Handle case of no RETURNING clause.
 	if returning == nil {
-		mb.outScope = &scope{builder: mb.b, expr: mb.outScope.expr}
+		expr := mb.outScope.expr
+		mb.outScope = mb.b.allocScope()
+		mb.outScope.expr = expr
 		return
 	}
 
@@ -823,21 +948,13 @@ func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 	//
 	inScope := mb.outScope.replace()
 	inScope.expr = mb.outScope.expr
-	inScope.cols = make([]scopeColumn, 0, mb.tab.ColumnCount())
-	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-		if cat.IsMutationColumn(mb.tab, i) {
-			continue
-		}
+	inScope.appendOrdinaryColumnsFromTable(mb.md.TableMeta(mb.tabID), &mb.alias)
 
-		tabCol := mb.tab.Column(i)
-		inScope.cols = append(inScope.cols, scopeColumn{
-			name:   tabCol.ColName(),
-			table:  *mb.alias,
-			typ:    tabCol.DatumType(),
-			id:     mb.tabID.ColumnID(i),
-			hidden: tabCol.IsHidden(),
-		})
-	}
+	// extraAccessibleCols contains all the columns that the RETURNING
+	// clause can refer to in addition to the table columns. This is useful for
+	// UPDATE ... FROM statements, where all columns from tables in the FROM clause
+	// are in scope for the RETURNING clause.
+	inScope.appendColumns(mb.extraAccessibleCols)
 
 	// Construct the Project operator that projects the RETURNING expressions.
 	outScope := inScope.replace()
@@ -856,11 +973,9 @@ func (mb *mutationBuilder) checkNumCols(expected, actual int) {
 			more, less = less, more
 		}
 
-		// TODO(andyk): Add UpsertOp case.
-		kw := "INSERT"
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		panic(pgerror.Newf(pgcode.Syntax,
 			"%s has more %s than %s, %d expressions for %d targets",
-			kw, more, less, actual, expected)})
+			strings.ToUpper(mb.opName), more, less, actual, expected))
 	}
 }
 
@@ -868,14 +983,14 @@ func (mb *mutationBuilder) checkNumCols(expected, actual int) {
 // computed value expression for the given table column, and caches it for
 // reuse.
 func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.Expr {
-	if mb.parsedExprs == nil {
-		mb.parsedExprs = make([]tree.Expr, mb.tab.ColumnCount())
+	if mb.parsedColExprs == nil {
+		mb.parsedColExprs = make([]tree.Expr, mb.tab.ColumnCount())
 	}
 
 	// Return expression from cache, if it was already parsed previously.
 	ord := mb.tabID.ColumnOrdinal(colID)
-	if mb.parsedExprs[ord] != nil {
-		return mb.parsedExprs[ord]
+	if mb.parsedColExprs[ord] != nil {
+		return mb.parsedColExprs[ord]
 	}
 
 	var exprStr string
@@ -885,17 +1000,79 @@ func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.E
 		exprStr = tabCol.ComputedExprStr()
 	case tabCol.HasDefault():
 		exprStr = tabCol.DefaultExprStr()
+	case tabCol.IsMutation() && !tabCol.IsNullable():
+		// Synthesize default value for NOT NULL mutation column so that it can be
+		// set when in the write-only state. This is only used when no other value
+		// is possible (no default value available, NULL not allowed).
+		datum, err := tree.NewDefaultDatum(mb.b.evalCtx, tabCol.DatumType())
+		if err != nil {
+			panic(err)
+		}
+		return datum
 	default:
 		return tree.DNull
 	}
 
 	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
-	mb.parsedExprs[ord] = expr
-	return mb.parsedExprs[ord]
+	mb.parsedColExprs[ord] = expr
+	return expr
+}
+
+// parsePartialIndexPredicateExpr parses the partial index predicate for the
+// given index and caches it for reuse. This function panics if the index at the
+// given ordinal is not a partial index.
+func (mb *mutationBuilder) parsePartialIndexPredicateExpr(idx cat.IndexOrdinal) tree.Expr {
+	index := mb.tab.Index(idx)
+
+	predStr, isPartial := index.Predicate()
+	if !isPartial {
+		panic(errors.AssertionFailedf("index at ordinal %d is not a partial index", idx))
+	}
+
+	if mb.parsedIndexExprs == nil {
+		mb.parsedIndexExprs = make([]tree.Expr, mb.tab.DeletableIndexCount())
+	}
+
+	// Return expression from the cache, if it was already parsed previously.
+	if mb.parsedIndexExprs[idx] != nil {
+		return mb.parsedIndexExprs[idx]
+	}
+
+	expr, err := parser.ParseExpr(predStr)
+	if err != nil {
+		panic(err)
+	}
+
+	mb.parsedIndexExprs[idx] = expr
+	return expr
+}
+
+// getIndexLaxKeyOrdinals returns the ordinals of all lax key columns in the
+// given index. A column's ordinal is the ordered position of that column in the
+// owning table.
+func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
+	var keyOrds util.FastIntSet
+	for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
+		keyOrds.Add(index.Column(i).Ordinal())
+	}
+	return keyOrds
+}
+
+// findNotNullIndexCol finds the first not-null column in the given index and
+// returns its ordinal position in the owner table. There must always be such a
+// column, even if it turns out to be an implicit primary key column.
+func findNotNullIndexCol(index cat.Index) int {
+	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+		indexCol := index.Column(i)
+		if !indexCol.IsNullable() {
+			return indexCol.Ordinal()
+		}
+	}
+	panic(errors.AssertionFailedf("should have found not null column in index"))
 }
 
 // resultsNeeded determines whether a statement that might have a RETURNING
@@ -907,38 +1084,8 @@ func resultsNeeded(r tree.ReturningClause) bool {
 	case *tree.ReturningNothing, *tree.NoReturningClause:
 		return false
 	default:
-		panic(errors.Errorf("unexpected ReturningClause type: %T", t))
+		panic(errors.AssertionFailedf("unexpected ReturningClause type: %T", t))
 	}
-}
-
-// getAliasedTableName returns the underlying table name for a TableExpr that
-// could be either an alias or a normal table name. It also returns the original
-// table name, which will be equal to the alias name if the input is an alias,
-// or identical to the table name if the input is a normal table name.
-//
-// This is not meant to perform name resolution, but rather simply to extract
-// the name indicated after FROM in DELETE/INSERT/UPDATE/UPSERT.
-func getAliasedTableName(n tree.TableExpr) (*tree.TableName, *tree.TableName) {
-	var alias *tree.TableName
-	if ate, ok := n.(*tree.AliasedTableExpr); ok {
-		n = ate.Expr
-		// It's okay to ignore the As columns here, as they're not permitted in
-		// DML aliases where this function is used. The grammar does not allow
-		// them, so the parser would have reported an error if they were present.
-		if ate.As.Alias != "" {
-			alias = tree.NewUnqualifiedTableName(ate.As.Alias)
-		}
-	}
-	tn, ok := n.(*tree.TableName)
-	if !ok {
-		panic(builderError{pgerror.Unimplemented(
-			"complex table expression in UPDATE/DELETE",
-			"cannot use a complex table name with DELETE/UPDATE")})
-	}
-	if alias == nil {
-		alias = tn
-	}
-	return tn, alias
 }
 
 // checkDatumTypeFitsColumnType verifies that a given scalar value type is valid
@@ -948,13 +1095,27 @@ func getAliasedTableName(n tree.TableExpr) (*tree.TableName, *tree.TableName) {
 // be different (eg. TEXT and VARCHAR will fit the same scalar type String).
 //
 // This is used by the UPDATE, INSERT and UPSERT code.
-func checkDatumTypeFitsColumnType(col cat.Column, typ types.T) {
-	if typ == types.Unknown || typ.Equivalent(col.DatumType()) {
+func checkDatumTypeFitsColumnType(col *cat.Column, typ *types.T) {
+	if typ.Equivalent(col.DatumType()) {
 		return
 	}
 
 	colName := string(col.ColName())
-	panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+	err := pgerror.Newf(pgcode.DatatypeMismatch,
 		"value type %s doesn't match type %s of column %q",
-		typ, col.ColTypeStr(), tree.ErrNameString(&colName))})
+		typ, col.DatumType(), tree.ErrNameString(colName))
+	err = errors.WithHint(err, "you will need to rewrite or cast the expression")
+	panic(err)
+}
+
+// partialIndexCount returns the number of public, write-only, and delete-only
+// partial indexes defined on the table.
+func partialIndexCount(tab cat.Table) int {
+	count := 0
+	for i, n := 0, tab.DeletableIndexCount(); i < n; i++ {
+		if _, ok := tab.Index(i).Predicate(); ok {
+			count++
+		}
+	}
+	return count
 }

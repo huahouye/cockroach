@@ -1,21 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "table_props.h"
-#include <rocksdb/table_properties.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/status.h>
+#include <rocksdb/table_properties.h>
 #include <rocksdb/types.h>
 #include "encoding.h"
 
@@ -23,6 +19,7 @@ namespace cockroach {
 
 namespace {
 
+// This is re-implemented in sst_writer.go and should be kept in sync.
 class TimeBoundTblPropCollector : public rocksdb::TablePropertiesCollector {
  public:
   const char* Name() const override { return "TimeBoundTblPropCollector"; }
@@ -32,7 +29,7 @@ class TimeBoundTblPropCollector : public rocksdb::TablePropertiesCollector {
       // Check to see if an intent was the last key in the SSTable. If
       // it was, we need to extract the timestamp from the intent and
       // update the bounds to include that timestamp.
-      cockroach::storage::engine::enginepb::MVCCMetadata meta;
+      cockroach::storage::enginepb::MVCCMetadata meta;
       if (!meta.ParseFromArray(last_value_.data(), last_value_.size())) {
         // We're unable to parse the MVCCMetadata. Fail open by not
         // setting the min/max timestamp properties.
@@ -112,9 +109,8 @@ class DeleteRangeTblPropCollector : public rocksdb::TablePropertiesCollector {
     return rocksdb::Status::OK();
   }
 
-  rocksdb::Status AddUserKey(const rocksdb::Slice&, const rocksdb::Slice&,
-                             rocksdb::EntryType type, rocksdb::SequenceNumber,
-                             uint64_t) override {
+  rocksdb::Status AddUserKey(const rocksdb::Slice&, const rocksdb::Slice&, rocksdb::EntryType type,
+                             rocksdb::SequenceNumber, uint64_t) override {
     if (type == rocksdb::kEntryRangeDeletion) {
       ntombstones_++;
     }
@@ -133,7 +129,7 @@ class DeleteRangeTblPropCollector : public rocksdb::TablePropertiesCollector {
   }
 
  private:
-  int ntombstones_;
+  int ntombstones_ = 0;
 };
 
 class DeleteRangeTblPropCollectorFactory : public rocksdb::TablePropertiesCollectorFactory {

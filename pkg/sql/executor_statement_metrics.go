@@ -1,23 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
+	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -43,13 +39,19 @@ const (
 	sessionInit sessionPhase = iota
 
 	// Executor phases.
-	sessionQueryReceived    // Query is received.
-	sessionStartParse       // Parse starts.
-	sessionEndParse         // Parse ends.
-	plannerStartLogicalPlan // Planning starts.
-	plannerEndLogicalPlan   // Planning ends.
-	plannerStartExecStmt    // Execution starts.
-	plannerEndExecStmt      // Execution ends.
+	sessionQueryReceived                  // Query is received.
+	sessionStartParse                     // Parse starts.
+	sessionEndParse                       // Parse ends.
+	plannerStartLogicalPlan               // Planning starts.
+	plannerEndLogicalPlan                 // Planning ends.
+	plannerStartExecStmt                  // Execution starts.
+	plannerEndExecStmt                    // Execution ends.
+	sessionTransactionReceived            // Transaction is received.
+	sessionFirstStartExecTransaction      // Transaction is started for the first time.
+	sessionMostRecentStartExecTransaction // Transaction is started for the most recent time.
+	sessionEndExecTransaction             // Transaction is committed/rolled back.
+	sessionStartTransactionCommit         // Transaction `COMMIT` starts.
+	sessionEndTransactionCommit           // Transaction `COMMIT` ends.
 
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
@@ -62,12 +64,43 @@ const (
 // copy behavior.
 type phaseTimes [sessionNumPhases]time.Time
 
+// getServiceLatency returns the time between a query being received and the end
+// of run.
+func (p *phaseTimes) getServiceLatency() time.Duration {
+	return p[plannerEndExecStmt].Sub(p[sessionQueryReceived])
+}
+
+// getRunLatency returns the time between a query execution starting and ending.
+func (p *phaseTimes) getRunLatency() time.Duration {
+	return p[plannerEndExecStmt].Sub(p[plannerStartExecStmt])
+}
+
+// getPlanningLatency returns the time it takes for a query to be planned.
+func (p *phaseTimes) getPlanningLatency() time.Duration {
+	return p[plannerEndLogicalPlan].Sub(p[plannerStartLogicalPlan])
+}
+
+// getParsingLatency returns the time it takes for a query to be parsed.
+func (p *phaseTimes) getParsingLatency() time.Duration {
+	return p[sessionEndParse].Sub(p[sessionStartParse])
+}
+
+func (p *phaseTimes) getTransactionRetryLatency() time.Duration {
+	return p[sessionMostRecentStartExecTransaction].Sub(p[sessionFirstStartExecTransaction])
+}
+
+func (p *phaseTimes) getTransactionServiceLatency() time.Duration {
+	return p[sessionEndExecTransaction].Sub(p[sessionTransactionReceived])
+}
+
+func (p *phaseTimes) getCommitLatency() time.Duration {
+	return p[sessionEndTransactionCommit].Sub(p[sessionStartTransactionCommit])
+}
+
 // EngineMetrics groups a set of SQL metrics.
 type EngineMetrics struct {
 	// The subset of SELECTs that are processed through DistSQL.
 	DistSQLSelectCount *metric.Counter
-	// The subset of queries that are processed by the cost-based optimizer.
-	SQLOptCount *metric.Counter
 	// The subset of queries which we attempted and failed to plan with the
 	// cost-based optimizer.
 	SQLOptFallbackCount   *metric.Counter
@@ -78,6 +111,15 @@ type EngineMetrics struct {
 	SQLExecLatency        *metric.Histogram
 	DistSQLServiceLatency *metric.Histogram
 	SQLServiceLatency     *metric.Histogram
+	SQLTxnLatency         *metric.Histogram
+
+	// TxnAbortCount counts transactions that were aborted, either due
+	// to non-retriable errors, or retriable errors when the client-side
+	// retry protocol is not in use.
+	TxnAbortCount *metric.Counter
+
+	// FailureCount counts non-retriable errors in open transactions.
+	FailureCount *metric.Counter
 }
 
 // EngineMetrics implements the metric.Struct interface
@@ -89,36 +131,27 @@ func (EngineMetrics) MetricStruct() {}
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
 // accounting in the passed-in EngineMetrics.
-// - samplePlanDescription can be nil, as these are only sampled periodically per unique fingerprint.
 // - distSQLUsed reports whether the query was distributed.
 // - automaticRetryCount is the count of implicit txn retries
 //   so far.
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
 func (ex *connExecutor) recordStatementSummary(
+	ctx context.Context,
 	planner *planner,
-	stmt Statement,
-	samplePlanDescription *roachpb.ExplainTreePlanNode,
-	planFlags planFlags,
 	automaticRetryCount int,
 	rowsAffected int,
 	err error,
+	stats topLevelQueryStats,
 ) {
-	phaseTimes := planner.statsCollector.PhaseTimes()
-
-	// Compute the run latency. This is always recorded in the
-	// server metrics.
-	runLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[plannerStartExecStmt])
+	phaseTimes := &ex.statsCollector.phaseTimes
 
 	// Collect the statistics.
+	runLatRaw := phaseTimes.getRunLatency()
 	runLat := runLatRaw.Seconds()
-
-	parseLat := phaseTimes[sessionEndParse].
-		Sub(phaseTimes[sessionStartParse]).Seconds()
-	planLat := phaseTimes[plannerEndLogicalPlan].
-		Sub(phaseTimes[plannerStartLogicalPlan]).Seconds()
-	// service latency: time query received to end of run
-	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionQueryReceived])
+	parseLat := phaseTimes.getParsingLatency().Seconds()
+	planLat := phaseTimes.getPlanningLatency().Seconds()
+	svcLatRaw := phaseTimes.getServiceLatency()
 	svcLat := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
@@ -127,43 +160,53 @@ func (ex *connExecutor) recordStatementSummary(
 	// overhead latency: txn/retry management, error checking, etc
 	execOverhead := svcLat - processingLat
 
+	stmt := planner.stmt
+	flags := planner.curPlan.flags
 	if automaticRetryCount == 0 {
+		ex.updateOptCounters(flags)
 		m := &ex.metrics.EngineMetrics
-		if planFlags.IsSet(planFlagOptUsed) {
-			m.SQLOptCount.Inc(1)
-		} else if planFlags.IsSet(planFlagOptFallback) {
-			m.SQLOptFallbackCount.Inc(1)
-		}
-
-		if planFlags.IsSet(planFlagDistributed) {
+		if flags.IsDistributed() {
 			if _, ok := stmt.AST.(*tree.Select); ok {
 				m.DistSQLSelectCount.Inc(1)
 			}
 			m.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 			m.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}
-		if planFlags.IsSet(planFlagOptCacheHit) {
-			m.SQLOptPlanCacheHits.Inc(1)
-		} else if planFlags.IsSet(planFlagOptCacheMiss) {
-			m.SQLOptPlanCacheMisses.Inc(1)
-		}
 		m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
-	planner.statsCollector.RecordStatement(
-		stmt, samplePlanDescription,
-		planFlags.IsSet(planFlagDistributed), planFlags.IsSet(planFlagOptUsed),
-		automaticRetryCount, rowsAffected, err,
-		parseLat, planLat, runLat, svcLat, execOverhead,
+	stmtID := ex.statsCollector.recordStatement(
+		stmt, planner.curPlan.planForStats,
+		flags.IsDistributed(), flags.IsSet(planFlagVectorized),
+		flags.IsSet(planFlagImplicitTxn), automaticRetryCount, rowsAffected, err,
+		parseLat, planLat, runLat, svcLat, execOverhead, stats,
 	)
+
+	// Do some transaction level accounting for the transaction this statement is
+	// a part of.
+
+	// We limit the number of statementIDs stored for a transaction, as dictated
+	// by the TxnStatsNumStmtIDsToRecord cluster setting.
+	maxStmtIDsLen := TxnStatsNumStmtIDsToRecord.Get(&ex.server.cfg.Settings.SV)
+	if int64(len(ex.extraTxnState.transactionStatementIDs)) < maxStmtIDsLen {
+		ex.extraTxnState.transactionStatementIDs = append(
+			ex.extraTxnState.transactionStatementIDs, stmtID)
+	}
+	// Add the current statement's ID to the hash. We don't track queries issued
+	// by the internal executor, in which case the hash function may be nil, and
+	// can therefore be safely ignored.
+	if ex.extraTxnState.transactionStatementsHash != nil {
+		ex.extraTxnState.transactionStatementsHash.Write([]byte(stmtID))
+	}
+	ex.extraTxnState.numRows += rowsAffected
 
 	if log.V(2) {
 		// ages since significant epochs
 		sessionAge := phaseTimes[plannerEndExecStmt].
 			Sub(phaseTimes[sessionInit]).Seconds()
 
-		log.Infof(planner.EvalContext().Ctx(),
+		log.Infof(ctx,
 			"query stats: %d rows, %d retries, "+
 				"parse %.2fµs (%.1f%%), "+
 				"plan %.2fµs (%.1f%%), "+
@@ -177,5 +220,15 @@ func (ex *connExecutor) recordStatementSummary(
 			execOverhead*1e6, 100*execOverhead/svcLat,
 			sessionAge,
 		)
+	}
+}
+
+func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
+	m := &ex.metrics.EngineMetrics
+
+	if planFlags.IsSet(planFlagOptCacheHit) {
+		m.SQLOptPlanCacheHits.Inc(1)
+	} else if planFlags.IsSet(planFlagOptCacheMiss) {
+		m.SQLOptPlanCacheMisses.Inc(1)
 	}
 }

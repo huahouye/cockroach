@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
@@ -18,7 +14,7 @@ import React from "react";
 import * as protos from "src/js/protos";
 
 import { AdminUIState } from "src/redux/state";
-import { refreshDatabaseDetails, refreshTableDetails, refreshTableStats, generateTableID} from "src/redux/apiReducers";
+import { refreshDatabaseDetails, refreshTableDetails, refreshTableStats, generateTableID, KeyedCachedDataReducerState} from "src/redux/apiReducers";
 
 import { SortSetting } from "src/views/shared/components/sortabletable";
 
@@ -35,7 +31,7 @@ export interface DatabaseSummaryExplicitData {
 interface DatabaseSummaryConnectedData {
   sortSetting: SortSetting;
   tableInfos: TableInfo[];
-  dbResponse: protos.cockroach.server.serverpb.DatabaseDetailsResponse;
+  dbResponse: KeyedCachedDataReducerState<protos.cockroach.server.serverpb.DatabaseDetailsResponse>;
   grants: protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant[];
 }
 
@@ -79,14 +75,14 @@ export class DatabaseSummaryBase extends React.Component<DatabaseSummaryProps, {
   }
 
   // Refresh when the component is mounted.
-  componentWillMount() {
+  componentDidMount() {
     this.props.refreshDatabaseDetails(new protos.cockroach.server.serverpb.DatabaseDetailsRequest({ database: this.props.name }));
     this.loadTableDetails();
   }
 
   // Refresh when the component receives properties.
-  componentWillReceiveProps(props: DatabaseSummaryProps) {
-    this.loadTableDetails(props);
+  componentDidUpdate() {
+    this.loadTableDetails(this.props);
   }
 
   render(): React.ReactElement<any> {

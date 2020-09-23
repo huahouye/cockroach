@@ -64,6 +64,7 @@ TEST_F(CCLTest, DBOpen) {
     DBEnvStatsResult stats;
     EXPECT_STREQ(DBGetEnvStats(db, &stats).data, NULL);
     EXPECT_STREQ(stats.encryption_status.data, NULL);
+    EXPECT_EQ(stats.encryption_type, enginepbccl::Plaintext);
     EXPECT_EQ(stats.total_files, 0);
     EXPECT_EQ(stats.total_bytes, 0);
     EXPECT_EQ(stats.active_key_files, 0);
@@ -86,6 +87,7 @@ TEST_F(CCLTest, DBOpen) {
                  "Invalid argument: encryption was used on this store before, but no encryption "
                  "flags specified. You need a CCL build and must fully specify the "
                  "--enterprise-encryption flag");
+    free(ret.data);
     ASSERT_OK(rocksdb::Env::Default()->DeleteFile(dir.Path(kFileRegistryFilename)));
   }
 
@@ -109,11 +111,13 @@ TEST_F(CCLTest, DBOpen) {
     DBEnvStatsResult stats;
     EXPECT_STREQ(DBGetEnvStats(db, &stats).data, NULL);
     EXPECT_STRNE(stats.encryption_status.data, NULL);
+    EXPECT_EQ(stats.encryption_type, enginepbccl::Plaintext);
 
     // Now parse the status protobuf.
     enginepbccl::EncryptionStatus enc_status;
     ASSERT_TRUE(
         enc_status.ParseFromArray(stats.encryption_status.data, stats.encryption_status.len));
+    free(stats.encryption_status.data);
     EXPECT_STREQ(enc_status.active_store_key().key_id().c_str(), "plain");
     EXPECT_STREQ(enc_status.active_data_key().key_id().c_str(), "plain");
 
@@ -144,6 +148,7 @@ TEST_F(CCLTest, ReadOnly) {
     DBString value;
     EXPECT_STREQ(DBGet(db, ToDBKey("foo"), &value).data, NULL);
     EXPECT_STREQ(ToString(value).c_str(), "foo's value");
+    free(value.data);
 
     DBClose(db);
   }
@@ -159,9 +164,11 @@ TEST_F(CCLTest, ReadOnly) {
     DBString ro_value;
     EXPECT_STREQ(DBGet(db, ToDBKey("foo"), &ro_value).data, NULL);
     EXPECT_STREQ(ToString(ro_value).c_str(), "foo's value");
+    free(ro_value.data);
     // Try to write it again.
-    EXPECT_EQ(ToString(DBPut(db, ToDBKey("foo"), ToDBSlice("foo's value"))),
-              "Not implemented: Not supported operation in read only mode.");
+    auto ret = DBPut(db, ToDBKey("foo"), ToDBSlice("foo's value"));
+    EXPECT_EQ(ToString(ret), "Not implemented: Not supported operation in read only mode.");
+    free(ret.data);
 
     DBClose(db);
   }
@@ -181,9 +188,11 @@ TEST_F(CCLTest, ReadOnly) {
     DBString ro_value;
     EXPECT_STREQ(DBGet(db, ToDBKey("foo"), &ro_value).data, NULL);
     EXPECT_STREQ(ToString(ro_value).c_str(), "foo's value");
+    free(ro_value.data);
     // Try to write it again.
-    EXPECT_EQ(ToString(DBPut(db, ToDBKey("foo"), ToDBSlice("foo's value"))),
-              "Not implemented: Not supported operation in read only mode.");
+    auto ret = DBPut(db, ToDBKey("foo"), ToDBSlice("foo's value"));
+    EXPECT_EQ(ToString(ret), "Not implemented: Not supported operation in read only mode.");
+    free(ret.data);
 
     DBClose(db);
   }
@@ -215,6 +224,7 @@ TEST_F(CCLTest, EncryptionStats) {
     DBEnvStatsResult stats;
     EXPECT_STREQ(DBGetEnvStats(db, &stats).data, NULL);
     EXPECT_STRNE(stats.encryption_status.data, NULL);
+    EXPECT_EQ(stats.encryption_type, enginepbccl::Plaintext);
 
     // Write a key.
     EXPECT_STREQ(DBPut(db, ToDBKey("foo"), ToDBSlice("foo's value")).data, NULL);
@@ -277,6 +287,7 @@ TEST_F(CCLTest, EncryptionStats) {
     DBEnvStatsResult stats;
     EXPECT_STREQ(DBGetEnvStats(db, &stats).data, NULL);
     EXPECT_STRNE(stats.encryption_status.data, NULL);
+    EXPECT_EQ(stats.encryption_type, enginepbccl::AES128_CTR);
 
     // Now parse the status protobuf.
     enginepbccl::EncryptionStatus enc_status;
@@ -324,9 +335,11 @@ TEST_F(CCLTest, EncryptionStats) {
 
     enginepbccl::DataKeysRegistry key_registry;
     ASSERT_TRUE(key_registry.ParseFromArray(result.key_registry.data, result.key_registry.len));
+    free(result.key_registry.data);
 
     enginepb::FileRegistry file_registry;
     ASSERT_TRUE(file_registry.ParseFromArray(result.file_registry.data, result.file_registry.len));
+    free(result.file_registry.data);
 
     // Check some registry contents.
     EXPECT_STRNE(key_registry.active_store_key_id().c_str(), "plain");

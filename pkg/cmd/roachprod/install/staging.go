@@ -1,25 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
 import (
+	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 )
 
 const (
@@ -27,20 +25,24 @@ const (
 	releaseBinaryServer = "https://s3.amazonaws.com/binaries.cockroachdb.com/"
 )
 
-func getEdgeBinaryURL(binaryName string, SHA string) (*url.URL, error) {
+func getEdgeURL(urlPathBase, SHA, arch string, ext string) (*url.URL, error) {
 	edgeBinaryLocation, err := url.Parse(edgeBinaryServer)
 	if err != nil {
 		return nil, err
 	}
-	edgeBinaryLocation.Path = binaryName
+	edgeBinaryLocation.Path = urlPathBase
+	// If a target architecture is provided, attach that.
+	if len(arch) > 0 {
+		edgeBinaryLocation.Path += "." + arch
+	}
 	// If a specific SHA is provided, just attach that.
 	if len(SHA) > 0 {
-		edgeBinaryLocation.Path += "." + SHA
+		edgeBinaryLocation.Path += "." + SHA + ext
 	} else {
-		edgeBinaryLocation.Path += ".LATEST"
+		edgeBinaryLocation.Path += ext + ".LATEST"
 		// Otherwise, find the latest SHA binary available. This works because
 		// "[executable].LATEST" redirects to the latest SHA.
-		resp, err := http.Head(edgeBinaryLocation.String())
+		resp, err := httputil.Head(context.TODO(), edgeBinaryLocation.String())
 		if err != nil {
 			return nil, err
 		}
@@ -53,23 +55,51 @@ func getEdgeBinaryURL(binaryName string, SHA string) (*url.URL, error) {
 // StageRemoteBinary downloads a cockroach edge binary with the provided
 // application path to each specified by the cluster. If no SHA is specified,
 // the latest build of the binary is used instead.
-func StageRemoteBinary(c *SyncedCluster, applicationName, binaryPath, SHA string) error {
-	binURL, err := getEdgeBinaryURL(binaryPath, SHA)
+// Returns the SHA of the resolve binary.
+func StageRemoteBinary(
+	c *SyncedCluster, applicationName, urlPathBase, SHA, arch string,
+) (string, error) {
+	binURL, err := getEdgeURL(urlPathBase, SHA, arch, "")
 	if err != nil {
-		return err
+		return "", err
 	}
 	fmt.Printf("Resolved binary url for %s: %s\n", applicationName, binURL)
+	urlSplit := strings.Split(binURL.Path, ".")
 	cmdStr := fmt.Sprintf(
 		`curl -sfSL -o %s "%s" && chmod 755 ./%s`, applicationName, binURL, applicationName,
 	)
-	return c.Run(
+	return urlSplit[len(urlSplit)-1], c.Run(
 		os.Stdout, os.Stderr, c.Nodes, fmt.Sprintf("staging binary (%s)", applicationName), cmdStr,
+	)
+}
+
+// StageOptionalRemoteLibrary downloads a library from the cockroach edge with the provided
+// application path to each specified by the cluster.
+// If no SHA is specified, the latest build of the library is used instead.
+// It will not error if the library does not exist on the edge.
+func StageOptionalRemoteLibrary(
+	c *SyncedCluster, libraryName, urlPathBase, SHA, arch, ext string,
+) error {
+	url, err := getEdgeURL(urlPathBase, SHA, arch, ext)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Resolved library url for %s: %s\n", libraryName, url)
+	cmdStr := fmt.Sprintf(
+		`mkdir -p ./lib && \
+curl -sfSL -o "./lib/%s" "%s" 2>/dev/null || echo 'optional library %s not found; continuing...'`,
+		libraryName+ext,
+		url,
+		libraryName+ext,
+	)
+	return c.Run(
+		os.Stdout, os.Stderr, c.Nodes, fmt.Sprintf("staging library (%s)", libraryName), cmdStr,
 	)
 }
 
 // StageCockroachRelease downloads an official CockroachDB release binary with
 // the specified version.
-func StageCockroachRelease(c *SyncedCluster, version string) error {
+func StageCockroachRelease(c *SyncedCluster, version, arch string) error {
 	if len(version) == 0 {
 		return fmt.Errorf(
 			"release application cannot be staged without specifying a specific version",
@@ -79,7 +109,7 @@ func StageCockroachRelease(c *SyncedCluster, version string) error {
 	if err != nil {
 		return err
 	}
-	binURL.Path += fmt.Sprintf("cockroach-%s.linux-amd64.tgz", version)
+	binURL.Path += fmt.Sprintf("cockroach-%s.%s.tgz", version, arch)
 	fmt.Printf("Resolved release url for cockroach version %s: %s\n", version, binURL)
 
 	// This command incantation:
@@ -91,6 +121,8 @@ func StageCockroachRelease(c *SyncedCluster, version string) error {
 tmpdir="$(mktemp -d /tmp/cockroach-release.XXX)" && \
 curl -f -s -S -o- %s | tar xfz - -C "${tmpdir}" --strip-components 1 && \
 mv ${tmpdir}/cockroach ./cockroach && \
+mkdir -p ./lib && \
+if [ -d ${tmpdir}/lib ]; then mv ${tmpdir}/lib/* ./lib; fi && \
 chmod 755 ./cockroach
 `, binURL)
 	return c.Run(

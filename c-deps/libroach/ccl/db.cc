@@ -90,6 +90,19 @@ class CCLEnvStatsHandler : public EnvStatsHandler {
     return active_key_info->key_id();
   }
 
+  virtual int32_t GetActiveStoreKeyType() override {
+    if (data_key_manager_ == nullptr) {
+      return enginepbccl::Plaintext;
+    }
+
+    auto store_key_info = data_key_manager_->GetActiveStoreKeyInfo();
+    if (store_key_info == nullptr) {
+      return enginepbccl::Plaintext;
+    }
+
+    return store_key_info->encryption_type();
+  }
+
   virtual rocksdb::Status GetFileEntryKeyID(const enginepb::FileEntry* entry,
                                             std::string* id) override {
     if (entry == nullptr) {
@@ -133,9 +146,10 @@ rocksdb::Status DBOpenHookCCL(std::shared_ptr<rocksdb::Logger> info_log, const s
         "on-disk version does not support encryption, but we found encryption flags");
   }
 
-  // We use a logger at V(0) for encryption status instead of the existing info_log.
-  // This should only be used to occasional logging (eg: key loading and rotation).
-  std::shared_ptr<rocksdb::Logger> logger(NewDBLogger(0));
+  // We log to the primary CockroachDB log for encryption status
+  // instead of the RocksDB specific log. This should only be used to
+  // occasional logging (eg: key loading and rotation).
+  std::shared_ptr<rocksdb::Logger> logger(NewDBLogger(true /* use_primary_log */));
 
   // We have encryption options. Check whether the AES instruction set is supported.
   if (!UsesAESNI()) {

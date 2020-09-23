@@ -5,7 +5,7 @@
 // the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
-//  (found in the LICENSE.Apache file in the root directory).
+//  (found in the licenses/CCL.txt file in the root directory).
 
 #include "ctr_stream.h"
 #include <google/protobuf/stubs/port.h>
@@ -77,7 +77,7 @@ rocksdb::Status CTRCipherStreamCreator::CreateCipherStreamFromSettings(
   auto key = key_manager_->GetKey(enc_settings.key_id());
   if (key == nullptr) {
     return rocksdb::Status::InvalidArgument(fmt::StringPrintf(
-        "key_manager does not have a key with ID %s", enc_settings.key_id().c_str()));
+        "store key ID %s was not found", enc_settings.key_id().c_str()));
   }
 
   result->reset(new CTRCipherStream(key, enc_settings.nonce(), enc_settings.counter()));

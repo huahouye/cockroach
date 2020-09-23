@@ -1,7 +1,4 @@
 restore_stmt ::=
-	'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 'WITH' kv_option_list
-	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 
-	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 
-	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 'AS' 'OF' 'SYSTEM' 'TIME' timestamp 'WITH' kv_option_list
-	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 'AS' 'OF' 'SYSTEM' 'TIME' timestamp 
-	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*) 'AS' 'OF' 'SYSTEM' 'TIME' timestamp 
+	'RESTORE' 'FROM' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
+	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
+	| 'RESTORE' ( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* ) 'FROM' string_or_placeholder 'IN' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options

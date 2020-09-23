@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "chunked_buffer.h"
 #include <rocksdb/db.h>
@@ -33,6 +29,7 @@ void chunkedBuffer::Put(const rocksdb::Slice& key, const rocksdb::Slice& value) 
   put(key.data(), key.size(), value.size());
   put(value.data(), value.size(), 0);
   count_++;
+  bytes_ += sizeof(size_buf) + key.size() + value.size(); // see (*pebbleResults).put
 }
 
 void chunkedBuffer::Clear() {
@@ -40,6 +37,7 @@ void chunkedBuffer::Clear() {
     delete[] bufs_[i].data;
   }
   count_ = 0;
+  bytes_ = 0;
   buf_ptr_ = nullptr;
   bufs_.clear();
 }
@@ -63,8 +61,8 @@ void chunkedBuffer::put(const char* data, int len, int next_size_hint) {
     data += avail;
     len -= avail;
 
-    const int max_size = 128 << 20; // 128 MB
-    int new_size = bufs_.empty() ? 16 : bufs_.back().len * 2;
+    const int max_size = 128 << 20;  // 128 MB
+    size_t new_size = bufs_.empty() ? 16 : bufs_.back().len * 2;
     for (; new_size < len + next_size_hint && new_size < max_size; new_size *= 2) {
     }
     if (new_size > max_size) {

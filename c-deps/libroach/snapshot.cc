@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "snapshot.h"
 #include "encoding.h"
@@ -54,6 +50,10 @@ DBIterator* DBSnapshot::NewIter(DBIterOptions iter_options) {
 
 DBStatus DBSnapshot::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
 
+DBStatus DBSnapshot::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  return FmtStatus("unsupported");
+}
+
 DBString DBSnapshot::GetCompactionStats() { return ToDBString("unsupported"); }
 
 DBStatus DBSnapshot::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
@@ -66,7 +66,7 @@ DBStatus DBSnapshot::EnvWriteFile(DBSlice path, DBSlice contents) {
   return FmtStatus("unsupported");
 }
 
-DBStatus DBSnapshot::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+DBStatus DBSnapshot::EnvOpenFile(DBSlice path, uint64_t bytes_per_sync, rocksdb::WritableFile** file) {
   return FmtStatus("unsupported");
 }
 
@@ -87,6 +87,32 @@ DBStatus DBSnapshot::EnvDeleteFile(DBSlice path) { return FmtStatus("unsupported
 DBStatus DBSnapshot::EnvDeleteDirAndFiles(DBSlice dir) { return FmtStatus("unsupported"); }
 
 DBStatus DBSnapshot::EnvLinkFile(DBSlice oldname, DBSlice newname) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBSnapshot::EnvOpenReadableFile(DBSlice path, rocksdb::RandomAccessFile** file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvReadAtFile(rocksdb::RandomAccessFile* file, DBSlice buffer, int64_t offset,
+                                   int* n) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvCloseReadableFile(rocksdb::RandomAccessFile* file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvOpenDirectory(DBSlice path, rocksdb::Directory** file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvSyncDirectory(rocksdb::Directory* file) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvCloseDirectory(rocksdb::Directory* file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvRenameFile(DBSlice oldname, DBSlice newname) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvCreateDir(DBSlice name) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvDeleteDir(DBSlice name) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvListDir(DBSlice name, std::vector<std::string>* result) {
   return FmtStatus("unsupported");
 }
 

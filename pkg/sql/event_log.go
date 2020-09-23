@@ -1,17 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,9 +14,9 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // EventLogType represents an event type that can be recorded in the event log.
@@ -34,6 +29,9 @@ const (
 	EventLogCreateDatabase EventLogType = "create_database"
 	// EventLogDropDatabase is recorded when a database is dropped.
 	EventLogDropDatabase EventLogType = "drop_database"
+
+	// EventLogDropSchema is recorded when a schema is dropped.
+	EventLogDropSchema EventLogType = "drop_schema"
 
 	// EventLogCreateTable is recorded when a table is created.
 	EventLogCreateTable EventLogType = "create_table"
@@ -49,6 +47,8 @@ const (
 	EventLogCommentOnDatabase EventLogType = "comment_on_database"
 	// EventLogCommentOnTable is recorded when a table is commented.
 	EventLogCommentOnTable EventLogType = "comment_on_table"
+	// EventLogCommentOnIndex is recorded when a index is commented.
+	EventLogCommentOnIndex EventLogType = "comment_on_index"
 
 	// EventLogCreateIndex is recorded when an index is created.
 	EventLogCreateIndex EventLogType = "create_index"
@@ -79,15 +79,26 @@ const (
 	// initiated schema change rollback has completed.
 	EventLogFinishSchemaRollback EventLogType = "finish_schema_change_rollback"
 
+	// EventLogCreateType is recorded when a type is created.
+	EventLogCreateType EventLogType = "create_type"
+	// EventLogDropType is recorded when a type is dropped.
+	EventLogDropType EventLogType = "drop_type"
+	// EventAlterType is recorded when a type is altered.
+	EventLogAlterType EventLogType = "alter_type"
+
 	// EventLogNodeJoin is recorded when a node joins the cluster.
 	EventLogNodeJoin EventLogType = "node_join"
 	// EventLogNodeRestart is recorded when an existing node rejoins the cluster
 	// after being offline.
 	EventLogNodeRestart EventLogType = "node_restart"
+
 	// EventLogNodeDecommissioned is recorded when a node is marked as
 	// decommissioning.
+	EventLogNodeDecommissioning EventLogType = "node_decommissioning"
+	// EventLogNodeDecommissioned is recorded when a node is marked as
+	// decommissioned.
 	EventLogNodeDecommissioned EventLogType = "node_decommissioned"
-	// EventLogNodeRecommissioned is recorded when a decommissioned node is
+	// EventLogNodeRecommissioned is recorded when a decommissioning node is
 	// recommissioned.
 	EventLogNodeRecommissioned EventLogType = "node_recommissioned"
 
@@ -98,6 +109,10 @@ const (
 	EventLogSetZoneConfig EventLogType = "set_zone_config"
 	// EventLogRemoveZoneConfig is recorded when a zone config is removed.
 	EventLogRemoveZoneConfig EventLogType = "remove_zone_config"
+
+	// EventLogCreateStatistics is recorded when statistics are collected for a
+	// table.
+	EventLogCreateStatistics EventLogType = "create_statistics"
 )
 
 // EventLogSetClusterSettingDetail is the json details for a settings change.
@@ -121,7 +136,7 @@ func MakeEventLogger(execCfg *ExecutorConfig) EventLogger {
 // provided transaction.
 func (ev EventLogger) InsertEventRecord(
 	ctx context.Context,
-	txn *client.Txn,
+	txn *kv.Txn,
 	eventType EventLogType,
 	targetID, reportingID int32,
 	info interface{},
@@ -157,7 +172,6 @@ VALUES(
 		}
 		args[3] = string(infoBytes)
 	}
-
 	rows, err := ev.Exec(ctx, "log-event", txn, insertEventTableStmt, args...)
 	if err != nil {
 		return err

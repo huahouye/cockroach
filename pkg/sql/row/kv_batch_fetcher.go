@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -18,12 +14,15 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // kvBatchSize is the number of keys we request at a time.
@@ -32,27 +31,36 @@ import (
 // TODO(radu): parameters like this should be configurable
 var kvBatchSize int64 = 10000
 
-// SetKVBatchSize changes the kvBatchFetcher batch size, and returns a function that restores it.
-func SetKVBatchSize(val int64) func() {
+// TestingSetKVBatchSize changes the kvBatchFetcher batch size, and returns a function that restores it.
+// This is to be used only in tests - we have no test coverage for arbitrary kv batch sizes at this time.
+func TestingSetKVBatchSize(val int64) func() {
 	oldVal := kvBatchSize
 	kvBatchSize = val
 	return func() { kvBatchSize = oldVal }
 }
 
+// sendFunc is the function used to execute a KV batch; normally
+// wraps (*client.Txn).Send.
+type sendFunc func(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error)
+
 // txnKVFetcher handles retrieval of key/values.
 type txnKVFetcher struct {
 	// "Constant" fields, provided by the caller.
-	txn   *client.Txn
-	spans roachpb.Spans
+	sendFn sendFunc
+	spans  roachpb.Spans
 	// If useBatchLimit is true, batches are limited to kvBatchSize. If
 	// firstBatchLimit is also set, the first batch is limited to that value.
 	// Subsequent batches are larger, up to kvBatchSize.
 	firstBatchLimit int64
 	useBatchLimit   bool
 	reverse         bool
-	// returnRangeInfo, if set, causes the kvBatchFetcher to populate rangeInfos.
-	// See also rowFetcher.returnRangeInfo.
-	returnRangeInfo bool
+	// lockStrength represents the locking mode to use when fetching KVs.
+	lockStrength descpb.ScanLockingStrength
+	// lockWaitPolicy represents the policy to be used for handling conflicting
+	// locks held by other active transactions.
+	lockWaitPolicy descpb.ScanLockingWaitPolicy
 
 	fetchEnd bool
 	batchIdx int
@@ -64,24 +72,12 @@ type txnKVFetcher struct {
 	requestSpans roachpb.Spans
 	responses    []roachpb.ResponseUnion
 
-	// As the kvBatchFetcher fetches batches of kvs, it accumulates information on the
-	// replicas where the batches came from. This info can be retrieved through
-	// getRangeInfo(), to be used for updating caches.
-	// rangeInfos are deduped, so they're not ordered in any particular way and
-	// they don't map to kvBatchFetcher.spans in any particular way.
-	rangeInfos       []roachpb.RangeInfo
 	origSpan         roachpb.Span
 	remainingBatches [][]byte
+	mon              *mon.BytesMonitor
 }
 
 var _ kvBatchFetcher = &txnKVFetcher{}
-
-func (f *txnKVFetcher) getRangesInfo() []roachpb.RangeInfo {
-	if !f.returnRangeInfo {
-		panic("GetRangeInfo() called on kvBatchFetcher that wasn't configured with returnRangeInfo")
-	}
-	return f.rangeInfos
-}
 
 // getBatchSize returns the max size of the next batch.
 func (f *txnKVFetcher) getBatchSize() int64 {
@@ -129,6 +125,53 @@ func (f *txnKVFetcher) getBatchSizeForIdx(batchIdx int) int64 {
 	}
 }
 
+// getKeyLockingStrength returns the configured per-key locking strength to use
+// for key-value scans.
+func (f *txnKVFetcher) getKeyLockingStrength() lock.Strength {
+	switch f.lockStrength {
+	case descpb.ScanLockingStrength_FOR_NONE:
+		return lock.None
+
+	case descpb.ScanLockingStrength_FOR_KEY_SHARE:
+		// Promote to FOR_SHARE.
+		fallthrough
+	case descpb.ScanLockingStrength_FOR_SHARE:
+		// We currently perform no per-key locking when FOR_SHARE is used
+		// because Shared locks have not yet been implemented.
+		return lock.None
+
+	case descpb.ScanLockingStrength_FOR_NO_KEY_UPDATE:
+		// Promote to FOR_UPDATE.
+		fallthrough
+	case descpb.ScanLockingStrength_FOR_UPDATE:
+		// We currently perform exclusive per-key locking when FOR_UPDATE is
+		// used because Upgrade locks have not yet been implemented.
+		return lock.Exclusive
+
+	default:
+		panic(errors.AssertionFailedf("unknown locking strength %s", f.lockStrength))
+	}
+}
+
+// getWaitPolicy returns the configured lock wait policy to use for key-value
+// scans.
+func (f *txnKVFetcher) getWaitPolicy() lock.WaitPolicy {
+	switch f.lockWaitPolicy {
+	case descpb.ScanLockingWaitPolicy_BLOCK:
+		return lock.WaitPolicy_Block
+
+	case descpb.ScanLockingWaitPolicy_SKIP:
+		// Should not get here. Query should be rejected during planning.
+		panic(errors.AssertionFailedf("unsupported wait policy %s", f.lockWaitPolicy))
+
+	case descpb.ScanLockingWaitPolicy_ERROR:
+		return lock.WaitPolicy_Error
+
+	default:
+		panic(errors.AssertionFailedf("unknown wait policy %s", f.lockWaitPolicy))
+	}
+}
+
 // makeKVBatchFetcher initializes a kvBatchFetcher for the given spans.
 //
 // If useBatchLimit is true, batches are limited to kvBatchSize. If
@@ -137,12 +180,38 @@ func (f *txnKVFetcher) getBatchSizeForIdx(batchIdx int) int64 {
 //
 // Batch limits can only be used if the spans are ordered.
 func makeKVBatchFetcher(
-	txn *client.Txn,
+	txn *kv.Txn,
 	spans roachpb.Spans,
 	reverse bool,
 	useBatchLimit bool,
 	firstBatchLimit int64,
-	returnRangeInfo bool,
+	lockStrength descpb.ScanLockingStrength,
+	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	mon *mon.BytesMonitor,
+) (txnKVFetcher, error) {
+	sendFn := func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+		res, err := txn.Send(ctx, ba)
+		if err != nil {
+			return nil, err.GoError()
+		}
+		return res, nil
+	}
+	return makeKVBatchFetcherWithSendFunc(
+		sendFn, spans, reverse, useBatchLimit, firstBatchLimit, lockStrength, lockWaitPolicy, mon,
+	)
+}
+
+// makeKVBatchFetcherWithSendFunc is like makeKVBatchFetcher but uses a custom
+// send function.
+func makeKVBatchFetcherWithSendFunc(
+	sendFn sendFunc,
+	spans roachpb.Spans,
+	reverse bool,
+	useBatchLimit bool,
+	firstBatchLimit int64,
+	lockStrength descpb.ScanLockingStrength,
+	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	mon *mon.BytesMonitor,
 ) (txnKVFetcher, error) {
 	if firstBatchLimit < 0 || (!useBatchLimit && firstBatchLimit != 0) {
 		return txnKVFetcher{}, errors.Errorf("invalid batch limit %d (useBatchLimit: %t)",
@@ -164,7 +233,7 @@ func makeKVBatchFetcher(
 				// Current span's start key is greater than or equal to the last span's
 				// end key - we're good.
 				continue
-			} else if spans[i].EndKey.Compare(spans[i-1].EndKey) < 0 {
+			} else if spans[i].EndKey.Compare(spans[i-1].Key) < 0 {
 				// Current span's end key is less than or equal to the last span's start
 				// key - also good.
 				continue
@@ -188,34 +257,61 @@ func makeKVBatchFetcher(
 	}
 
 	return txnKVFetcher{
-		txn:             txn,
+		sendFn:          sendFn,
 		spans:           copySpans,
 		reverse:         reverse,
 		useBatchLimit:   useBatchLimit,
 		firstBatchLimit: firstBatchLimit,
-		returnRangeInfo: returnRangeInfo,
+		lockStrength:    lockStrength,
+		lockWaitPolicy:  lockWaitPolicy,
+		mon:             mon,
 	}, nil
 }
 
-// fetch retrieves spans from the kv
+// maxScanResponseBytes is the maximum number of bytes a scan request can
+// return.
+const maxScanResponseBytes = 10 * (1 << 20)
+
+// fetch retrieves spans from the kv layer.
 func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	var ba roachpb.BatchRequest
+	ba.Header.WaitPolicy = f.getWaitPolicy()
 	ba.Header.MaxSpanRequestKeys = f.getBatchSize()
-	ba.Header.ReturnRangeInfo = f.returnRangeInfo
+	if ba.Header.MaxSpanRequestKeys > 0 {
+		// If this kvfetcher limits the number of rows returned, also use
+		// target bytes to guard against the case in which the average row
+		// is very large.
+		// If no limit is set, the assumption is that SQL *knows* that there
+		// is only a "small" amount of data to be read, and wants to preserve
+		// concurrency for this request inside of DistSender, which setting
+		// TargetBytes would interfere with.
+		ba.Header.TargetBytes = maxScanResponseBytes
+	}
 	ba.Requests = make([]roachpb.RequestUnion, len(f.spans))
+	keyLocking := f.getKeyLockingStrength()
 	if f.reverse {
-		scans := make([]roachpb.ReverseScanRequest, len(f.spans))
+		scans := make([]struct {
+			req   roachpb.ReverseScanRequest
+			union roachpb.RequestUnion_ReverseScan
+		}, len(f.spans))
 		for i := range f.spans {
-			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
-			scans[i].SetSpan(f.spans[i])
-			ba.Requests[i].MustSetInner(&scans[i])
+			scans[i].req.SetSpan(f.spans[i])
+			scans[i].req.ScanFormat = roachpb.BATCH_RESPONSE
+			scans[i].req.KeyLocking = keyLocking
+			scans[i].union.ReverseScan = &scans[i].req
+			ba.Requests[i].Value = &scans[i].union
 		}
 	} else {
-		scans := make([]roachpb.ScanRequest, len(f.spans))
+		scans := make([]struct {
+			req   roachpb.ScanRequest
+			union roachpb.RequestUnion_Scan
+		}, len(f.spans))
 		for i := range f.spans {
-			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
-			scans[i].SetSpan(f.spans[i])
-			ba.Requests[i].MustSetInner(&scans[i])
+			scans[i].req.SetSpan(f.spans[i])
+			scans[i].req.ScanFormat = roachpb.BATCH_RESPONSE
+			scans[i].req.KeyLocking = keyLocking
+			scans[i].union.Scan = &scans[i].req
+			ba.Requests[i].Value = &scans[i].union
 		}
 	}
 	if cap(f.requestSpans) < len(f.spans) {
@@ -226,22 +322,22 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	copy(f.requestSpans, f.spans)
 
 	if log.ExpensiveLogEnabled(ctx, 2) {
-		buf := bytes.NewBufferString("Scan ")
+		var buf bytes.Buffer
 		for i, span := range f.spans {
 			if i != 0 {
 				buf.WriteString(", ")
 			}
 			buf.WriteString(span.String())
 		}
-		log.VEvent(ctx, 2, buf.String())
+		log.VEventf(ctx, 2, "Scan %s", buf.String())
 	}
 
 	// Reset spans in preparation for adding resume-spans below.
 	f.spans = f.spans[:0]
 
-	br, err := f.txn.Send(ctx, ba)
+	br, err := f.sendFn(ctx, ba)
 	if err != nil {
-		return err.GoError()
+		return err
 	}
 	if br != nil {
 		f.responses = br.Responses
@@ -260,7 +356,7 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 			return errors.Errorf(
 				"span with results after resume span; it shouldn't happen given that "+
 					"we're only scanning non-overlapping spans. New spans: %s",
-				sqlbase.PrettySpans(nil, f.spans, 0 /* skip */))
+				catalogkeys.PrettySpans(nil, f.spans, 0 /* skip */))
 		}
 
 		if resumeSpan := header.ResumeSpan; resumeSpan != nil {
@@ -269,13 +365,6 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 			f.spans = append(f.spans, *resumeSpan)
 			// Verify we don't receive results for any remaining spans.
 			sawResumeSpan = true
-		}
-
-		// Fill up the RangeInfos, in case we got any.
-		if f.returnRangeInfo {
-			for _, ri := range header.RangeInfos {
-				f.rangeInfos = roachpb.InsertRangeInfo(f.rangeInfos, ri)
-			}
 		}
 	}
 
